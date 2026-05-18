@@ -1,0 +1,21 @@
+diff --git a/build/esm/transports/websocket.js b/build/esm/transports/websocket.js
+index ca01acc565d35e63b707323af5e0dbc90db80a0a..493f95d54413d5531d3cd1c0f60f9b2b2a41202d 100644
+--- a/build/esm/transports/websocket.js
++++ b/build/esm/transports/websocket.js
+@@ -113,11 +113,13 @@ const WebSocketCtor = globalThis.WebSocket || globalThis.MozWebSocket;
+  */
+ export class WS extends BaseWS {
+     createSocket(uri, protocols, opts) {
++        // Support custom WebSocket constructor via opts.webSocket (e.g. TorWebSocket for .onion)
++        const Ctor = this.opts.webSocket || WebSocketCtor;
+         return !isReactNative
+             ? protocols
+-                ? new WebSocketCtor(uri, protocols)
+-                : new WebSocketCtor(uri)
+-            : new WebSocketCtor(uri, protocols, opts);
++                ? new Ctor(uri, protocols)
++                : new Ctor(uri)
++            : new Ctor(uri, protocols, opts);
+     }
+     doWrite(_packet, data) {
+         this.ws.send(data);

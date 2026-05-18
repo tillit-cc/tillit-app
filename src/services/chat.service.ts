@@ -1,0 +1,2891 @@
+import SignalProtocol from 'signal-protocol';
+import * as Haptics from 'expo-haptics';
+import { SocketConnectionState } from '@/types/connection';
+import { serverRegistry } from './server-registry';
+import { sessionService } from './session.service';
+import { senderKeyService } from './sender-key.service';
+import { queueService } from './queue.service';
+import { messageRepository } from '@/db/repositories/message.repository';
+import { roomRepository } from '@/db/repositories/room.repository';
+import { profileRepository } from '@/db/repositories/profile.repository';
+import { sessionRepository } from '@/db/repositories/session.repository';
+import { senderKeyRepository } from '@/db/repositories/sender-key.repository';
+import { useChatStore } from '@/stores/chat.store';
+import { useAuthStore } from '@/stores/auth.store';
+import { useAppStore } from '@/stores/app.store';
+import { useServerStore } from '@/stores/server.store';
+import {
+  MessageEnvelope,
+  MessageEnvelopeFactory,
+  UserMessageType,
+  UserMessageTypeValue,
+  ControlPacketType,
+  ControlPacketTypeValue,
+  MessageStatus,
+  ImageMessagePayload,
+  PersistentImagePayload,
+  EphemeralImagePayload,
+  FileMessagePayload,
+  SendResult,
+  MessageStatusType,
+} from '@/types/message';
+import { mediaCryptoService } from './media-crypto.service';
+import { Message, NewMessage } from '@/db/schema';
+import { generateUUID, generateLocalId } from '@/types/message';
+import {PAGE_SIZE, SENDER_KEY_THRESHOLD, TYPING_THROTTLE_MS} from '@/config/app.config';
+import { logger } from '@/utils/logger';
+import { generateThumbnailFromBase64, generateColorPreviewFromBase64, saveImageToFile, deleteImagesByMessageIds, readImageAsBase64 } from '@/utils/image';
+import { readFileAsBase64, saveFileToCache, deleteFilesByMessageIds, fileExists, resolveFilePath, MAX_FILE_SIZE } from '@/utils/file';
+import { toLocalRoomId, toBackendRoomId, getServerIdFromRoomId } from '@/utils/server-id';
+
+class ChatService {
+  private initialized = false;
+  private connectingLocks = new Set<number>(); // per-server lock
+  private unsubscribes: (() => void)[] = [];
+
+  // In-memory dedup: prevents concurrent processing of the same message
+  private processingMessages = new Set<string>();
+
+  // Rate limiting for incoming typing indicators (per roomId:userId)
+  private typingReceiveThrottle = new Map<string, number>();
+
+  // Serial message queue: prevents concurrent Signal Protocol operations
+  private messageQueue: Promise<void> = Promise.resolve();
+  private enqueueSignalOperation<T>(operation: () => Promise<T>): Promise<T> {
+    return new Promise<T>((resolve, reject) => {
+      this.messageQueue = this.messageQueue
+        .then(() => operation().then(resolve, reject))
+        .catch((error) => {
+          logger.error('[ChatService] enqueueSignalOperation queue error:', error);
+          reject(error);
+        });
+    });
+  }
+
+  // Typing indicator throttle: roomId -> last sent timestamp
+  private typingThrottleMap = new Map<number, number>();
+
+  // ========================================
+  // INITIALIZATION
+  // ========================================
+
+  /**
+   * Initialize chat service: attach socket handlers on ALL servers and start queue.
+   */
+  init(): void {
+    // Cleanup existing handlers
+    this.unsubscribes.forEach((fn) => fn());
+    this.unsubscribes = [];
+
+    // Clear all socket service handlers to prevent accumulation
+    for (const server of serverRegistry.getAllServers()) {
+      const socket = serverRegistry.getSocket(server.id);
+      socket.clearAllServiceHandlers();
+    }
+
+    // Register handlers on each server's socket
+    for (const server of serverRegistry.getAllServers()) {
+      this.registerSocketHandlers(server.id);
+    }
+
+    if (!this.initialized) {
+      // Configure queue send function (only once)
+      queueService.setSendFunction(async (envelope) => {
+        const socket = serverRegistry.getSocketForRoom(envelope.id_room);
+        const backendRoomId = toBackendRoomId(envelope.id_room);
+        return socket.sendMessage(
+          backendRoomId,
+          envelope,
+          envelope.category,
+          envelope.type
+        );
+      });
+
+      queueService.startProcessor();
+    }
+
+    this.initialized = true;
+    logger.info('[ChatService] Initialized');
+  }
+
+  /**
+   * Register socket handlers when a new server is added after init.
+   */
+  registerSocketHandlers(serverId: number): void {
+    const socket = serverRegistry.getSocket(serverId);
+
+    const unsub1 = socket.onMessage(async (envelope) => {
+      // envelope.id_room may contain the sender's local room ID (with their server offset).
+      // Extract the backend room ID first, then apply the receiver's server offset.
+      envelope.id_room = toLocalRoomId(serverId, toBackendRoomId(envelope.id_room));
+      await this.handleIncomingMessage(envelope);
+    });
+
+    const unsub2 = socket.onPacket(async (envelope) => {
+      envelope.id_room = toLocalRoomId(serverId, toBackendRoomId(envelope.id_room));
+      await this.handleIncomingMessage(envelope);
+    });
+
+    const unsub3 = socket.onStateChange(async (state) => {
+      // Update per-server connection state in store
+      useServerStore.getState().setConnectionState(serverId, state);
+
+      if (state === SocketConnectionState.CONNECTED) {
+        logger.info(`[ChatService] Server ${serverId} connected - processing pending & joining rooms`);
+        await this.onConnected(serverId);
+      }
+    });
+
+    const unsub4 = socket.onSenderKeysAvailable(async (data: { roomId: number; senderUserId: number; distributionId: string }) => {
+      const localRoomId = toLocalRoomId(serverId, toBackendRoomId(data.roomId));
+      logger.info('[ChatService] Sender keys available notification:', localRoomId, 'from:', data.senderUserId);
+      try {
+        await this.enqueueSignalOperation(() => senderKeyService.fetchAndProcessPendingSenderKeys(localRoomId));
+      } catch (error) {
+        logger.error('[ChatService] Failed to process sender keys notification:', error);
+      }
+    });
+
+    const unsub5 = socket.onRoomDeleted(async (data) => {
+      const localRoomId = toLocalRoomId(serverId, data.roomId);
+      logger.info('[ChatService] roomDeleted event for room', localRoomId, 'by', data.deletedBy);
+      await this.performLocalRoomCleanup(localRoomId);
+    });
+
+    const unsub6 = socket.onUserLeftRoom(async (data) => {
+      const localRoomId = toLocalRoomId(serverId, data.roomId);
+      logger.info('[ChatService] userLeftRoom event for room', localRoomId, 'user', data.userId);
+      await this.handleUserLeftRoom(localRoomId, data.userId);
+    });
+
+    this.unsubscribes.push(unsub1, unsub2, unsub3, unsub4, unsub5, unsub6);
+  }
+
+  /**
+   * Cleanup on logout
+   */
+  destroy(): void {
+    this.unsubscribes.forEach((fn) => fn());
+    this.unsubscribes = [];
+    queueService.stopProcessor();
+    queueService.clearQueue();
+    this.initialized = false;
+    this.connectingLocks.clear();
+    this.messageQueue = Promise.resolve();
+    this.processingMessages.clear();
+    logger.info('[ChatService] Destroyed');
+  }
+
+  /**
+   * Called when a specific server's socket connects.
+   */
+  private async onConnected(serverId: number): Promise<void> {
+    if (this.connectingLocks.has(serverId)) return;
+    this.connectingLocks.add(serverId);
+
+    try {
+      logger.info(`[ChatService] onConnected(${serverId}): starting sync...`);
+
+      // 1. Sync rooms from backend
+      await this.syncAllRoomsFromBackend(serverId).catch((error) => {
+        logger.warn(`[ChatService] syncAllRoomsFromBackend(${serverId}) error:`, error);
+      });
+
+      // 2. Sync room members and establish sessions
+      await this.syncRoomMembersAndSessions(serverId).catch((error) => {
+        logger.warn(`[ChatService] syncRoomMembersAndSessions(${serverId}) error:`, error);
+      });
+
+      // 2b. Load all room profiles into store (needed for room list display names)
+      await this.loadAllRoomProfiles().catch((error) => {
+        logger.warn(`[ChatService] loadAllRoomProfiles error:`, error);
+      });
+
+      // 3. Process pending message queue
+      await queueService.forceProcess();
+
+      // 4. Fetch pending sender keys for all rooms on this server
+      await this.enqueueSignalOperation(() => this.fetchPendingSenderKeysForServer(serverId)).catch((error) => {
+        logger.warn(`[ChatService] fetchPendingSenderKeysForServer(${serverId}) error:`, error);
+      });
+
+      // 5. Refresh pre-keys for this server
+      await sessionService.refreshPreKeysIfNeeded(serverId);
+
+      // 6. Retry stuck sending messages
+      await this.retrySendingMessages().catch((error) => {
+        logger.warn('[ChatService] retrySendingMessages error:', error);
+      });
+
+      logger.info(`[ChatService] onConnected(${serverId}): sync complete`);
+    } catch (error) {
+      logger.error(`[ChatService] onConnected(${serverId}) error:`, error);
+    } finally {
+      this.connectingLocks.delete(serverId);
+    }
+  }
+
+  /**
+   * Sync all rooms from a specific server's backend API.
+   */
+  async syncAllRoomsFromBackend(serverId: number): Promise<void> {
+    const api = serverRegistry.getApi(serverId);
+    logger.info(`[ChatService] syncAllRoomsFromBackend(${serverId}): fetching rooms from API...`);
+
+    try {
+      const response = await api.getAllRooms();
+      const backendRooms = response?.rooms ?? [];
+
+      logger.info(`[ChatService] syncAllRoomsFromBackend(${serverId}): got`, backendRooms.length, 'rooms from backend');
+
+      // Build set of backend local IDs for orphan detection
+      const backendLocalIds = new Set<number>();
+
+      for (const roomData of backendRooms) {
+        try {
+          const localId = toLocalRoomId(serverId, roomData.id);
+          backendLocalIds.add(localId);
+          await roomRepository.upsert({
+            id: localId,
+            name: roomData.name,
+            inviteCode: roomData.inviteCode,
+            status: roomData.status ?? 0,
+            idUser: roomData.idUser,
+            useSenderKeys: roomData.useSenderKeys ? 1 : 0,
+            administered: roomData.administered ? 1 : 0,
+            serverId,
+          });
+        } catch (error) {
+          logger.warn(`[ChatService] syncAllRoomsFromBackend(${serverId}): failed to upsert room`, roomData.id, error);
+        }
+      }
+
+      // Cleanup orphan rooms: local rooms no longer present on the backend
+      try {
+        const localRooms = await roomRepository.findByServerId(serverId);
+        let orphanCount = 0;
+        for (const localRoom of localRooms) {
+          if (!backendLocalIds.has(localRoom.id)) {
+            logger.info(`[ChatService] syncAllRoomsFromBackend(${serverId}): removing orphan room`, localRoom.id);
+            await this.performLocalRoomCleanup(localRoom.id);
+            orphanCount++;
+          }
+        }
+        if (orphanCount > 0) {
+          logger.info(`[ChatService] syncAllRoomsFromBackend(${serverId}): removed`, orphanCount, 'orphan rooms');
+        }
+      } catch (error) {
+        logger.warn(`[ChatService] syncAllRoomsFromBackend(${serverId}): orphan cleanup error:`, error);
+      }
+
+      await this.loadRooms();
+    } catch (error) {
+      logger.error(`[ChatService] syncAllRoomsFromBackend(${serverId}) error:`, error);
+    }
+  }
+
+  /**
+   * Sync room members and establish sessions (scoped to a server).
+   */
+  async syncRoomMembersAndSessions(serverId: number): Promise<void> {
+    const userId = useAuthStore.getState().userId;
+    if (!userId) return;
+
+    const api = serverRegistry.getApi(serverId);
+    const rooms = await roomRepository.findAllWithMetadata(userId);
+    const serverRooms = rooms.filter((r) => r.serverId === serverId);
+
+    logger.info(`[ChatService] syncRoomMembersAndSessions(${serverId}): checking`, serverRooms.length, 'rooms');
+
+    const serverUserId = serverRegistry.getUserIdForServer(serverId);
+
+    for (const room of serverRooms) {
+      try {
+        const backendRoomId = toBackendRoomId(room.id);
+        const members = await api.getRoomMembers(backendRoomId);
+
+        for (const member of members) {
+          // Skip self — check both global and server-specific user ID
+          if (member.id_user === userId || member.id_user === serverUserId) continue;
+
+          const existingSession = await sessionRepository.findByUserAndRoom(
+            String(member.id_user),
+            room.id
+          );
+
+          if (!existingSession) {
+            logger.info(`[ChatService] syncRoomMembersAndSessions(${serverId}): new member found in room`, room.id, '- establishing session with', member.id_user);
+
+            try {
+              await this.enqueueSignalOperation(async () => {
+                const success = await sessionService.setSession(
+                  room.id,
+                  member.id_user,
+                  member.username || `user-${member.id_user}`,
+                  1
+                );
+
+                if (success) {
+                  useChatStore.getState().updateRoomInList(room.id, { hasSession: true });
+
+                  if (room.useSenderKeys === 1) {
+                    try {
+                      await senderKeyService.redistributeToNewMembers(room.id, [member.id_user]);
+                    } catch (skError) {
+                      logger.warn('[ChatService] syncRoomMembersAndSessions: sender key redistribution failed for', member.id_user, skError);
+                    }
+                  }
+                }
+              });
+            } catch (sessionError) {
+              logger.warn('[ChatService] syncRoomMembersAndSessions: failed to establish session with', member.id_user, sessionError);
+            }
+          }
+
+          await profileRepository.upsert({
+            idUser: member.id_user,
+            idRoom: room.id,
+            username: member.username || `user-${member.id_user}`,
+          });
+        }
+      } catch (error) {
+        logger.warn(`[ChatService] syncRoomMembersAndSessions(${serverId}): failed for room`, room.id, error);
+      }
+    }
+  }
+
+  /**
+   * Fetch and process pending sender keys for all rooms on a specific server.
+   */
+  async fetchPendingSenderKeysForServer(serverId: number): Promise<void> {
+    const userId = useAuthStore.getState().userId;
+    if (!userId) return;
+
+    const rooms = await roomRepository.findAllWithMetadata(userId);
+    const serverRooms = rooms.filter((r) => r.serverId === serverId);
+
+    for (const room of serverRooms) {
+      try {
+        await senderKeyService.initializeSenderKeysIfNeeded(room.id);
+      } catch (error) {
+        logger.warn('[ChatService] initializeSenderKeysIfNeeded failed for room', room.id, error);
+      }
+
+      if (room.useSenderKeys) {
+        try {
+          logger.info('[ChatService] Fetching pending sender keys for room', room.id);
+          await senderKeyService.fetchAndProcessPendingSenderKeys(room.id);
+        } catch (error) {
+          logger.warn('[ChatService] fetchPendingSenderKeys failed for room', room.id, error);
+        }
+      }
+    }
+  }
+
+  // ========================================
+  // MESSAGE ROUTING
+  // ========================================
+
+  async handleIncomingMessage(envelope: MessageEnvelope): Promise<void> {
+    const userId = useAuthStore.getState().userId;
+    // Also check server-specific user ID (different per server)
+    const serverUserId = serverRegistry.getUserIdForRoom(envelope.id_room);
+
+    if (envelope.category !== 'system' && (envelope.id_user_from === userId || envelope.id_user_from === serverUserId)) {
+      logger.info('[ChatService] Skipping own message:', envelope.id, 'category:', envelope.category);
+      return;
+    }
+
+    // Hard cap on payload size. Anything bigger than this is dropped before
+    // hitting the serial messageQueue — otherwise a malicious server could
+    // stall encrypt/decrypt for everyone by sending one giant envelope.
+    // 256 KB is well above any legitimate E2EE payload (text < 10KB, image
+    // metadata < 1KB, sender-key distribution < 2KB).
+    const MAX_PAYLOAD_BYTES = 256 * 1024;
+    try {
+      const payloadSize = JSON.stringify(envelope.payload ?? null).length;
+      if (payloadSize > MAX_PAYLOAD_BYTES) {
+        logger.warn('[ChatService] Dropping oversized envelope:', envelope.id, 'size:', payloadSize);
+        return;
+      }
+    } catch {
+      logger.warn('[ChatService] Dropping unserializable envelope:', envelope.id);
+      return;
+    }
+
+    const dedupKey = `${envelope.category}:${envelope.id}`;
+    if (this.processingMessages.has(dedupKey)) return;
+    this.processingMessages.add(dedupKey);
+
+    this.messageQueue = this.messageQueue
+      .then(() => this.processEnvelope(envelope))
+      .catch((error) => {
+        logger.error('[ChatService] messageQueue error:', error);
+      });
+  }
+
+  private async processEnvelope(envelope: MessageEnvelope): Promise<void> {
+    const dedupKey = `${envelope.category}:${envelope.id}`;
+    const roomId = envelope.id_room;
+
+    try {
+      switch (envelope.category) {
+        case 'user':
+          await this.handleUserMessage(envelope, roomId);
+          break;
+        case 'senderkey_message':
+          await this.handleSenderKeyMessage(envelope, roomId);
+          break;
+        case 'control':
+          await this.handleControlPacket(envelope, roomId);
+          break;
+        case 'system':
+          await this.handleSystemMessage(envelope, roomId);
+          break;
+        default:
+          logger.warn('[ChatService] Unknown category:', envelope.category);
+      }
+    } catch (error) {
+      logger.error('[ChatService] handleIncomingMessage error:', error);
+    } finally {
+      setTimeout(() => this.processingMessages.delete(dedupKey), 60000);
+    }
+  }
+
+  // ========================================
+  // USER MESSAGES (pair-wise encrypted)
+  // ========================================
+
+  private async handleUserMessage(envelope: MessageEnvelope, roomId: number): Promise<void> {
+    const userId = useAuthStore.getState().userId;
+    logger.info(`[ChatService][User:${userId}] handleUserMessage:`, envelope.id, 'room:', roomId, 'from:', envelope.id_user_from);
+    if (!userId) return;
+
+    const existing = await messageRepository.findById(envelope.id);
+    if (existing) return;
+
+    const payload = envelope.payload as any;
+    const serverUserId = serverRegistry.getUserIdForRoom(roomId);
+    const encryptedBody = payload?.body?.[`${serverUserId}`] || payload?.body?.[`${userId}`] || (envelope as any).body?.[`${serverUserId}`] || (envelope as any).body?.[`${userId}`];
+
+    if (!encryptedBody) {
+      logger.error('[ChatService] Missing encrypted body for user', userId, 'serverUserId:', serverUserId);
+      return;
+    }
+
+    const decrypted = await this.decrypt(encryptedBody, roomId, envelope.id_user_from);
+    if (decrypted === false) {
+      logger.warn('[ChatService] Decrypt failed (may be from old session)', envelope.id);
+      return;
+    }
+
+    let parsedPayload: any;
+    try {
+      parsedPayload = JSON.parse(decrypted);
+    } catch {
+      parsedPayload = { text: decrypted };
+    }
+
+    const body = this.extractUserBody(envelope.type as UserMessageTypeValue, parsedPayload);
+
+    const currentRoomId = useChatStore.getState().currentRoomId;
+    const isViewingRoom = currentRoomId === roomId;
+
+    const message: NewMessage = {
+      id: envelope.id,
+      type: envelope.type,
+      body,
+      encryptedBody: '',
+      idRoom: roomId,
+      idUserFrom: envelope.id_user_from,
+      idUserTo: envelope.id_user_to || 0,
+      timestamp: envelope.timestamp,
+      idStatus: isViewingRoom ? MessageStatus.READ : MessageStatus.DELIVERED,
+      read: isViewingRoom ? Math.floor(Date.now() / 1000) : null,
+      version: envelope.version || '2.0',
+      idParent: envelope.id_parent || null,
+    };
+
+    await messageRepository.create(message);
+
+    const store = useChatStore.getState();
+    store.addMessage(roomId, message as Message);
+    store.updateRoomInList(roomId, { hasSession: true });
+    store.setTyping(roomId, envelope.id_user_from, false);
+
+    if (envelope.type === UserMessageType.IMAGE && parsedPayload?.base64) {
+      this.persistImageToFilesystem(envelope.id, roomId, parsedPayload as ImageMessagePayload).catch((err) => {
+        logger.warn('[ChatService] Received image persist failed:', err);
+      });
+    }
+
+    if (envelope.type === UserMessageType.PERSISTENT_IMAGE && parsedPayload?.mediaId) {
+      this.downloadAndDecryptPersistentImage(envelope.id, roomId, parsedPayload as PersistentImagePayload).catch((err) => {
+        logger.warn('[ChatService] Persistent image download failed:', err);
+      });
+    }
+
+    // Ephemeral images: do NOT auto-download. Body already contains metadata for lazy loading.
+
+    this.updateRoomAfterMessage(roomId, body, envelope.type);
+
+    if (!isViewingRoom) {
+      const currentRoom = store.allRooms.find(r => r.id === roomId);
+      store.updateRoomInList(roomId, {
+        unreadCount: (currentRoom?.unreadCount ?? 0) + 1,
+      });
+      Haptics.notificationAsync(Haptics.NotificationFeedbackType.Success).catch(() => {});
+
+      const roomName = currentRoom?.name || '';
+      const senderProfile = store.profiles.get(roomId)?.get(envelope.id_user_from);
+      const roomProfiles = store.profiles.get(roomId);
+      const is1to1 = roomProfiles && roomProfiles.size === 2;
+      useAppStore.getState().showNotificationBanner({
+        roomId,
+        roomName: (is1to1 && senderProfile?.username) ? senderProfile.username : roomName,
+        senderName: is1to1 ? '' : (senderProfile?.username || ''),
+        messagePreview: body,
+        messageType: envelope.type,
+        timestamp: Date.now(),
+      });
+    }
+
+    await this.sendControlPacket(
+      roomId,
+      ControlPacketType.MESSAGE_DELIVERED,
+      { id_message: envelope.id },
+      envelope.id_user_from,
+      { inline: true }
+    );
+
+    if (isViewingRoom) {
+      await this.sendControlPacket(
+        roomId,
+        ControlPacketType.MESSAGE_READ,
+        { id_message: envelope.id },
+        envelope.id_user_from,
+        { inline: true }
+      );
+    }
+  }
+
+  // ========================================
+  // SENDER KEY MESSAGES (group encrypted)
+  // ========================================
+
+  private async handleSenderKeyMessage(
+    envelope: MessageEnvelope,
+    roomId: number,
+    retryCount = 0
+  ): Promise<void> {
+    const userId = useAuthStore.getState().userId;
+    logger.info(`[ChatService][User:${userId}] handleSenderKeyMessage:`, envelope.id, 'room:', roomId, 'from:', envelope.id_user_from, 'retry:', retryCount);
+
+    try {
+      const existing = await messageRepository.findById(envelope.id);
+      if (existing) {
+        logger.info(`[ChatService][User:${userId}] Sender key message already processed:`, envelope.id);
+        return;
+      }
+
+      const senderUserId = envelope.id_user_from;
+      const payload = envelope.payload as any;
+      const ciphertext = payload?.ciphertext || payload?.message?.ciphertext || (envelope as any).ciphertext;
+
+      logger.info(`[ChatService][User:${userId}] Sender key ciphertext found:`, !!ciphertext, 'length:', ciphertext?.length);
+
+      if (!ciphertext) {
+        logger.error('[ChatService] Sender key message missing ciphertext, payload:', JSON.stringify(payload).slice(0, 200));
+        return;
+      }
+
+      let plaintext: string;
+      try {
+        plaintext = await senderKeyService.decryptWithSenderKey(roomId, senderUserId, ciphertext, envelope.device_id_from);
+      } catch (decryptError: any) {
+        const isError19 =
+          decryptError?.message?.includes('SignalError error 19') ||
+          decryptError?.message?.includes('error 19') ||
+          decryptError?.code === 19;
+
+        if (isError19 && retryCount === 0) {
+          logger.info(`[ChatService][User:${userId}] No sender key state for user ${senderUserId}, fetching pending keys...`);
+          await senderKeyService.fetchAndProcessPendingSenderKeys(roomId);
+          return this.handleSenderKeyMessage(envelope, roomId, retryCount + 1);
+        }
+        throw decryptError;
+      }
+
+      const parsedPayload = JSON.parse(plaintext);
+      const body = this.extractUserBody(envelope.type as UserMessageTypeValue, parsedPayload);
+
+      const currentRoomId = useChatStore.getState().currentRoomId;
+      const isViewingRoom = currentRoomId === roomId;
+
+      const message: NewMessage = {
+        id: envelope.id,
+        type: envelope.type,
+        body,
+        encryptedBody: '',
+        idRoom: roomId,
+        idUserFrom: senderUserId,
+        idUserTo: 0,
+        timestamp: envelope.timestamp,
+        idStatus: isViewingRoom ? MessageStatus.READ : MessageStatus.DELIVERED,
+        read: isViewingRoom ? Math.floor(Date.now() / 1000) : null,
+        version: '2.0',
+        idParent: envelope.id_parent || null,
+      };
+
+      await messageRepository.create(message);
+      const store = useChatStore.getState();
+      store.addMessage(roomId, message as Message);
+      store.setTyping(roomId, senderUserId, false);
+
+      if (envelope.type === UserMessageType.IMAGE && parsedPayload?.base64) {
+        this.persistImageToFilesystem(envelope.id, roomId, parsedPayload as ImageMessagePayload).catch((err) => {
+          logger.warn('[ChatService] Received SK image persist failed:', err);
+        });
+      }
+
+      if (envelope.type === UserMessageType.PERSISTENT_IMAGE && parsedPayload?.mediaId) {
+        this.downloadAndDecryptPersistentImage(envelope.id, roomId, parsedPayload as PersistentImagePayload).catch((err) => {
+          logger.warn('[ChatService] SK persistent image download failed:', err);
+        });
+      }
+
+      // Ephemeral images: do NOT auto-download.
+
+      this.updateRoomAfterMessage(roomId, body, envelope.type);
+
+      if (!isViewingRoom) {
+        const currentRoom = store.allRooms.find(r => r.id === roomId);
+        store.updateRoomInList(roomId, {
+          unreadCount: (currentRoom?.unreadCount ?? 0) + 1,
+        });
+        Haptics.notificationAsync(Haptics.NotificationFeedbackType.Success).catch(() => {});
+
+        const roomName = currentRoom?.name || '';
+        const senderProfile = store.profiles.get(roomId)?.get(senderUserId);
+        const roomProfiles = store.profiles.get(roomId);
+        const is1to1 = roomProfiles && roomProfiles.size === 2;
+        useAppStore.getState().showNotificationBanner({
+          roomId,
+          roomName: (is1to1 && senderProfile?.username) ? senderProfile.username : roomName,
+          senderName: is1to1 ? '' : (senderProfile?.username || ''),
+          messagePreview: body,
+          messageType: envelope.type,
+          timestamp: Date.now(),
+        });
+      }
+
+      await this.sendControlPacket(
+        roomId,
+        ControlPacketType.MESSAGE_DELIVERED,
+        { id_message: envelope.id },
+        senderUserId,
+        { inline: true }
+      );
+
+      if (isViewingRoom) {
+        await this.sendControlPacket(
+          roomId,
+          ControlPacketType.MESSAGE_READ,
+          { id_message: envelope.id },
+          senderUserId,
+          { inline: true }
+        );
+      }
+
+      logger.info(`[ChatService][User:${userId}] Sender key message processed:`, envelope.id);
+    } catch (error) {
+      logger.error('[ChatService] Failed to decrypt sender key message:', error);
+    }
+  }
+
+  // ========================================
+  // CONTROL PACKETS
+  // ========================================
+
+  private async handleControlPacket(envelope: MessageEnvelope, roomId: number): Promise<void> {
+    const userId = useAuthStore.getState().userId;
+    logger.info(`[ChatService][User:${userId}] handleControlPacket:`, envelope.type, 'id:', envelope.id, 'room:', roomId, 'from:', envelope.id_user_from, 'encrypted:', envelope.encrypted);
+    if (!userId) return;
+
+    let packetPayload: any;
+
+    if (!envelope.encrypted) {
+      const payload = envelope.payload as any;
+      packetPayload = typeof payload?.body === 'string'
+        ? JSON.parse(payload.body)
+        : payload?.body || payload;
+    } else if ((envelope.payload as any)?.ciphertext && (envelope.payload as any)?.distributionId) {
+      try {
+        const decrypted = await senderKeyService.decryptWithSenderKey(
+          roomId,
+          envelope.id_user_from,
+          (envelope.payload as any).ciphertext,
+          envelope.device_id_from,
+        );
+        packetPayload = JSON.parse(decrypted);
+      } catch (error: any) {
+        const isError19 =
+          error?.message?.includes('SignalError error 19') ||
+          error?.message?.includes('error 19') ||
+          error?.code === 19;
+
+        if (isError19) {
+          logger.info(`[ChatService][User:${userId}] Control packet: no sender key state from ${envelope.id_user_from}, fetching pending keys...`);
+          try {
+            await senderKeyService.fetchAndProcessPendingSenderKeys(roomId);
+            const decrypted = await senderKeyService.decryptWithSenderKey(
+              roomId,
+              envelope.id_user_from,
+              (envelope.payload as any).ciphertext,
+              envelope.device_id_from,
+            );
+            packetPayload = JSON.parse(decrypted);
+          } catch (retryError) {
+            logger.error('[ChatService] Control packet sender key decrypt failed after retry:', retryError);
+            return;
+          }
+        } else {
+          logger.error('[ChatService] Control packet sender key decrypt failed:', error);
+          return;
+        }
+      }
+    } else {
+      const payload = envelope.payload as any;
+      // Use server-specific user ID for the encrypted body lookup — each server
+      // assigns its own user IDs, so ciphertext is keyed by the server-local ID.
+      const serverUserId = serverRegistry.getUserIdForRoom(roomId);
+      const encryptedBody = payload?.body?.[`${serverUserId}`] || payload?.body?.[`${userId}`] || (envelope as any).body?.[`${serverUserId}`] || (envelope as any).body?.[`${userId}`];
+
+      if (!encryptedBody) {
+        logger.error(`[ChatService][User:${userId}] Control packet missing encrypted body, type: ${envelope.type} serverUserId: ${serverUserId}`);
+        return;
+      }
+
+      logger.info(`[ChatService][User:${userId}] Decrypting control packet type: ${envelope.type} from: ${envelope.id_user_from}`);
+      const decrypted = await this.decrypt(encryptedBody, roomId, envelope.id_user_from);
+      if (decrypted === false) {
+        logger.warn(`[ChatService][User:${userId}] Control packet decrypt failed, type: ${envelope.type} from: ${envelope.id_user_from}`);
+        return;
+      }
+
+      packetPayload = JSON.parse(decrypted);
+    }
+
+    await this.processControlPacket(
+      envelope.type as ControlPacketTypeValue,
+      packetPayload,
+      roomId,
+      envelope.id_user_from
+    );
+  }
+
+  private async processControlPacket(
+    type: ControlPacketTypeValue,
+    payload: any,
+    roomId: number,
+    fromUserId: number
+  ): Promise<void> {
+    const store = useChatStore.getState();
+
+    switch (type) {
+      case ControlPacketType.MESSAGE_DELIVERED: {
+        const existingMsg = store.messages.get(roomId)?.find(m => m.id === payload.id_message);
+        const currentStatus = existingMsg?.idStatus ?? 0;
+
+        if (currentStatus < MessageStatus.DELIVERED) {
+          logger.info('[ChatService] Processing DELIVERED for message:', payload.id_message, 'room:', roomId, 'currentStatus:', currentStatus);
+          await messageRepository.updateStatus(payload.id_message, MessageStatus.DELIVERED);
+          store.updateMessage(roomId, payload.id_message, { idStatus: MessageStatus.DELIVERED });
+        } else {
+          logger.info('[ChatService] Skipping DELIVERED for message:', payload.id_message, '- already at status:', currentStatus);
+        }
+        break;
+      }
+
+      case ControlPacketType.MESSAGE_READ: {
+        const existingMsg = store.messages.get(roomId)?.find(m => m.id === payload.id_message);
+        const currentStatus = existingMsg?.idStatus ?? 0;
+
+        if (currentStatus < MessageStatus.READ && currentStatus !== MessageStatus.FAILED && currentStatus !== MessageStatus.UNDELIVERED) {
+          logger.info('[ChatService] Processing READ for message:', payload.id_message, 'room:', roomId, 'currentStatus:', currentStatus);
+          await messageRepository.updateStatus(payload.id_message, MessageStatus.READ);
+          store.updateMessage(roomId, payload.id_message, { idStatus: MessageStatus.READ });
+
+          const updatedMsg = useChatStore.getState().messages.get(roomId)?.find(m => m.id === payload.id_message);
+          logger.info('[ChatService] After READ update: messageId:', payload.id_message, 'newStatus:', updatedMsg?.idStatus);
+        } else {
+          logger.info('[ChatService] Skipping READ for message:', payload.id_message, '- already at status:', currentStatus);
+        }
+        break;
+      }
+
+      case ControlPacketType.PROFILE_UPDATED:
+        if (payload.username) {
+          await profileRepository.upsert({
+            idUser: fromUserId,
+            idRoom: roomId,
+            username: payload.username,
+          });
+          store.updateProfile(roomId, fromUserId, { username: payload.username });
+        }
+        break;
+
+      case ControlPacketType.SESSION_ESTABLISHED:
+        // The decrypt of this packet already auto-established the session in
+        // libsignal (PreKeySignalMessage → X3DH). We just need to update the
+        // store and redistribute sender keys if needed.
+        logger.info('[ChatService] SESSION_ESTABLISHED received from', fromUserId, 'in room', roomId);
+        store.updateRoomInList(roomId, { hasSession: true });
+        // Use username from SESSION_ESTABLISHED payload if available,
+        // otherwise create placeholder only if no profile exists yet.
+        {
+          const peerUsername = payload?.username;
+          if (peerUsername) {
+            await profileRepository.upsert({
+              idUser: fromUserId,
+              idRoom: roomId,
+              username: peerUsername,
+            });
+            store.updateProfile(roomId, fromUserId, { username: peerUsername });
+          } else {
+            const existingProfile = await profileRepository.findByUserAndRoom(fromUserId, roomId);
+            if (!existingProfile) {
+              const placeholder = `user-${fromUserId}`;
+              await profileRepository.upsert({
+                idUser: fromUserId,
+                idRoom: roomId,
+                username: placeholder,
+              });
+              store.updateProfile(roomId, fromUserId, { username: placeholder });
+            }
+          }
+        }
+        {
+          const room = await roomRepository.findById(roomId);
+          if (room?.useSenderKeys === 1) {
+            try {
+              await senderKeyService.redistributeToNewMembers(roomId, [fromUserId]);
+            } catch (skError) {
+              logger.warn('[ChatService] SESSION_ESTABLISHED: sender key redistribution failed:', skError);
+            }
+          }
+        }
+        break;
+
+      case ControlPacketType.TYPING_STARTED: {
+        const typingKey = `${roomId}:${fromUserId}`;
+        const lastTyping = this.typingReceiveThrottle.get(typingKey) || 0;
+        const now = Date.now();
+        if (now - lastTyping < 1000) break;
+        this.typingReceiveThrottle.set(typingKey, now);
+        store.setTyping(roomId, fromUserId, true);
+        break;
+      }
+
+      case ControlPacketType.TYPING_STOPPED:
+        store.setTyping(roomId, fromUserId, false);
+        break;
+
+      default:
+        logger.info('[ChatService] Unknown control packet type:', type);
+    }
+  }
+
+
+  // ========================================
+  // SYSTEM MESSAGES
+  // ========================================
+
+  private async handleSystemMessage(envelope: MessageEnvelope, roomId: number): Promise<void> {
+    const payload = envelope.payload as any;
+
+    switch (envelope.type) {
+      case 'user_joined':
+        if (payload.user_id) {
+          const joinedUsername = payload.username || `user-${payload.user_id}`;
+          await profileRepository.upsert({
+            idUser: payload.user_id,
+            idRoom: roomId,
+            username: joinedUsername,
+          });
+          useChatStore.getState().updateProfile(roomId, payload.user_id, { username: joinedUsername });
+
+          // Establish session with the new member (skip self).
+          // This handles the real-time (online) case. If offline,
+          // syncRoomMembersAndSessions() on reconnect catches it.
+          // If B's first message arrives before this, decryptMessage()
+          // auto-establishes the session via PreKeySignalMessage.
+          const joinedUserId = useAuthStore.getState().userId;
+          const joinedServerUserId = serverRegistry.getUserIdForRoom(roomId);
+          if (payload.user_id !== joinedUserId && payload.user_id !== joinedServerUserId) {
+            const existingSession = await sessionRepository.findByUserAndRoom(
+              String(payload.user_id),
+              roomId
+            );
+
+            if (!existingSession) {
+              logger.info('[ChatService] user_joined: establishing session with', payload.user_id, 'in room', roomId);
+              try {
+                const success = await sessionService.setSession(
+                  roomId,
+                  payload.user_id,
+                  payload.username || `user-${payload.user_id}`,
+                  1
+                );
+
+                if (success) {
+                  useChatStore.getState().updateRoomInList(roomId, { hasSession: true });
+
+                  const room = await roomRepository.findById(roomId);
+                  if (room?.useSenderKeys === 1) {
+                    try {
+                      await senderKeyService.redistributeToNewMembers(roomId, [payload.user_id]);
+                    } catch (skError) {
+                      logger.warn('[ChatService] user_joined: sender key redistribution failed:', skError);
+                    }
+                  }
+                }
+              } catch (error) {
+                logger.warn('[ChatService] user_joined: session establishment failed for', payload.user_id, error);
+              }
+            }
+          }
+        }
+        break;
+
+      case 'user_left':
+        logger.info('[ChatService] User left room:', payload.user_id);
+        break;
+
+      case 'room_deleted':
+        logger.info('[ChatService] room_deleted received for room', roomId);
+        await this.performLocalRoomCleanup(roomId);
+        break;
+
+      case 'room_renamed':
+        if (payload.newName) {
+          await roomRepository.update(roomId, { name: payload.newName });
+          useChatStore.getState().updateRoomInList(roomId, { name: payload.newName });
+        }
+        break;
+
+      case 'message_deleted': {
+        const deletedMessageId = payload.message_id;
+        if (!deletedMessageId) {
+          logger.warn('[ChatService] message_deleted: no message_id in payload');
+          break;
+        }
+
+        const existingMsg = await messageRepository.findById(deletedMessageId);
+        logger.info('[ChatService] message_deleted:', deletedMessageId, 'room:', roomId, 'found:', !!existingMsg);
+
+        if (existingMsg) {
+          if (existingMsg.type === UserMessageType.IMAGE || existingMsg.type === UserMessageType.PERSISTENT_IMAGE || existingMsg.type === UserMessageType.EPHEMERAL_IMAGE) {
+            deleteImagesByMessageIds([deletedMessageId]);
+          }
+          await messageRepository.delete(deletedMessageId);
+          useChatStore.getState().removeMessage(roomId, deletedMessageId);
+          await this.refreshRoomLastMessage(roomId);
+        } else {
+          // Message already deleted locally (sender echo) — just ensure store is clean
+          useChatStore.getState().removeMessage(roomId, deletedMessageId);
+        }
+        break;
+      }
+
+      default:
+        logger.warn('[ChatService] Unknown system message type:', envelope.type);
+    }
+  }
+
+  // ========================================
+  // ENCRYPTION / DECRYPTION
+  // ========================================
+
+  private async encrypt(
+    roomId: number,
+    message: string
+  ): Promise<{ senderKey?: boolean; ciphertext?: string; distributionId?: string; message?: Record<string, string> }> {
+    const room = await roomRepository.findById(roomId);
+    if (room?.useSenderKeys === 1) {
+      try {
+        const { ciphertext, distributionId } = await senderKeyService.encryptWithSenderKey(roomId, message);
+        return { senderKey: true, ciphertext, distributionId };
+      } catch (error) {
+        logger.warn('[ChatService] Sender key encryption failed, falling back to pair-wise:', error);
+      }
+    }
+
+    const sessions = await sessionRepository.findByRoom(roomId);
+    const ownUserId = String(serverRegistry.getUserIdForRoom(roomId) || useAuthStore.getState().userId || '');
+
+    logger.info('[ChatService] encrypt: room:', roomId, 'sessions:', sessions.length, 'ownUserId:', ownUserId,
+      sessions.length > 0 ? 'sessionUsers: ' + sessions.map(s => s.idUser).join(',') : '(no sessions in DB for this room)');
+
+    if (!sessions || sessions.length === 0) {
+      throw new Error('No sessions found for room');
+    }
+
+    const encrypted: Record<string, string> = {};
+
+    for (const session of sessions) {
+      const remoteUserId = String(session.idUser);
+      if (remoteUserId === ownUserId) continue;
+
+      await sessionService.ensureSession(roomId, Number(remoteUserId));
+
+      try {
+        const { encryptedMessage } = await SignalProtocol.encryptMessage(
+          encodeURIComponent(message),
+          remoteUserId,
+        );
+        logger.info('[ChatService] encrypt: encrypted for user', remoteUserId, 'OK, length:', encryptedMessage?.length);
+        encrypted[remoteUserId] = encryptedMessage;
+      } catch (encError) {
+        logger.error('[ChatService] encrypt: encryptMessage FAILED for user', remoteUserId, encError);
+        throw encError;
+      }
+    }
+
+    if (Object.keys(encrypted).length === 0) {
+      throw new Error('No remote sessions available for room');
+    }
+
+    return { message: encrypted };
+  }
+
+  private async decrypt(
+    body: string,
+    roomId: number,
+    fromUserId: number,
+    retryCount = 0
+  ): Promise<string | false> {
+    const globalUserId = String(useAuthStore.getState().userId || '');
+    const serverUserId = String(serverRegistry.getUserIdForRoom(roomId) || globalUserId);
+    const remoteUserId = String(fromUserId);
+
+    try {
+      if (remoteUserId === globalUserId || remoteUserId === serverUserId) return false;
+
+      logger.info(`[ChatService][User:${globalUserId}] decrypt: from user ${remoteUserId}, room ${roomId}, bodyLen: ${body?.length}`);
+
+      const decryptResult = await SignalProtocol.decryptMessage(body, remoteUserId);
+
+      logger.info(`[ChatService][User:${globalUserId}] decrypt: SUCCESS from user ${remoteUserId}`);
+
+      await sessionService.ensureSessionInDatabase(roomId, remoteUserId);
+      await sessionService.updateSessionTimestamp(roomId, remoteUserId);
+
+      return decodeURIComponent(decryptResult.message);
+    } catch (error: any) {
+      logger.warn(`[ChatService][User:${globalUserId}] Decrypt error from user ${remoteUserId}, room ${roomId}:`, error?.message || error);
+
+      const isError12 =
+        error?.message?.includes('SignalError 12') ||
+        error?.message?.includes('UntrustedIdentity') ||
+        error?.code === 12;
+
+      if (isError12) {
+        logger.error('[ChatService] SECURITY: Identity key mismatch!');
+        sessionService.handleIdentityKeyChanged(roomId, fromUserId);
+        return false;
+      }
+
+      const isError11 =
+        error?.message?.includes('SignalError error 11') ||
+        error?.message?.includes('invalidKey') ||
+        error?.message?.includes('No pre-key with id') ||
+        error?.code === 11;
+
+      if (isError11 && retryCount === 0) {
+        logger.warn('[ChatService] Pre-key not found — recovering session with', fromUserId);
+        try {
+          await sessionService.recoverSession(roomId, String(fromUserId), `user-${fromUserId}`);
+          sessionService.refreshPreKeysIfNeeded(getServerIdFromRoomId(roomId) || undefined).catch(() => {});
+        } catch (recoverError) {
+          logger.error('[ChatService] Session recovery failed:', recoverError);
+        }
+        return false;
+      }
+
+      const isError6 =
+        error?.message?.includes('SignalError 6') ||
+        error?.message?.includes('InvalidMessage') ||
+        error?.code === 6;
+
+      if (isError6) {
+        logger.warn(`[ChatService][User:${globalUserId}] Error 6 (InvalidMessage) from user ${remoteUserId} - NOT recovering to preserve in-flight messages`);
+      }
+
+      return false;
+    }
+  }
+
+  // ========================================
+  // SENDING MESSAGES
+  // ========================================
+
+  async sendMessage(
+    roomId: number,
+    text: string,
+    parentId?: string,
+    replaceMessageId?: string
+  ): Promise<void> {
+    const userId = useAuthStore.getState().userId;
+    if (!userId) throw new Error('Not authenticated');
+
+    const envelope = MessageEnvelopeFactory.createTextMessage(roomId, userId, text, {
+      id_parent: parentId,
+      encrypted: true,
+    });
+
+    await this.sendEnvelope(envelope, text, replaceMessageId ? { replaceMessageId } : undefined);
+  }
+
+  async sendImageMessage(
+    roomId: number,
+    imagePayload: ImageMessagePayload,
+    parentId?: string,
+    replaceMessageId?: string
+  ): Promise<SendResult> {
+    const userId = useAuthStore.getState().userId;
+    if (!userId) throw new Error('Not authenticated');
+
+    // 1. Determine IDs upfront for optimistic message
+    const room = await roomRepository.findById(roomId);
+    const isSenderKeyRoom = room?.useSenderKeys === 1;
+    const envelopeId = generateUUID();
+    const localId = isSenderKeyRoom ? generateLocalId() : envelopeId;
+
+    // 2. Show message immediately with base64 body (no thumbnail yet)
+    const store = useChatStore.getState();
+    const message: Message = {
+      id: localId,
+      type: UserMessageType.IMAGE,
+      body: JSON.stringify(imagePayload),
+      encryptedBody: '',
+      idRoom: roomId,
+      idUserFrom: userId,
+      idUserTo: 0,
+      timestamp: Date.now(),
+      idStatus: MessageStatus.SENDING,
+      version: '2.0',
+      idParent: parentId || null,
+      read: null,
+      expiryDatetime: null,
+      lastModified: null,
+    };
+    if (replaceMessageId) {
+      store.swapMessage(roomId, replaceMessageId, message);
+      await messageRepository.delete(replaceMessageId);
+    } else {
+      store.addMessage(roomId, message);
+    }
+    await messageRepository.create(message);
+
+    // 3. Generate thumbnail (UI already showing the message)
+    if (!imagePayload.thumbnail) {
+      try {
+        const thumbnail = await generateThumbnailFromBase64(
+          imagePayload.base64,
+          imagePayload.mimeType
+        );
+        if (thumbnail) {
+          imagePayload.thumbnail = thumbnail;
+        }
+      } catch (error) {
+        logger.warn('[ChatService] Thumbnail generation failed, sending without:', error);
+      }
+    }
+
+    // 4. Create envelope with full payload (including thumbnail)
+    const envelope = MessageEnvelopeFactory.createImageMessage(roomId, userId, imagePayload, {
+      id_parent: parentId,
+      encrypted: true,
+    });
+    envelope.id = envelopeId;
+
+    // 5. Encrypt + send (skip optimistic message creation — already done above)
+    const result = await this.sendEnvelope(envelope, JSON.stringify(imagePayload), {
+      skipOptimistic: true,
+      localId,
+    });
+
+    // 6. Persist to filesystem (fire-and-forget)
+    this.persistImageToFilesystem(result.messageId, roomId, imagePayload).catch((err) => {
+      logger.warn('[ChatService] Post-send image persist failed:', err);
+    });
+
+    return result;
+  }
+
+  async sendPersistentImageMessage(
+    roomId: number,
+    imagePayload: ImageMessagePayload,
+    parentId?: string,
+    replaceMessageId?: string
+  ): Promise<SendResult> {
+    const userId = useAuthStore.getState().userId;
+    if (!userId) throw new Error('Not authenticated');
+
+    // 1. Create optimistic message immediately with base64 body
+    const envelopeId = generateUUID();
+    const optimisticBody = JSON.stringify({
+      base64: imagePayload.base64,
+      thumbnail: '',
+      width: imagePayload.width,
+      height: imagePayload.height,
+      mimeType: imagePayload.mimeType,
+    });
+
+    const store = useChatStore.getState();
+    const message: Message = {
+      id: envelopeId,
+      type: UserMessageType.PERSISTENT_IMAGE,
+      body: optimisticBody,
+      encryptedBody: '',
+      idRoom: roomId,
+      idUserFrom: userId,
+      idUserTo: 0,
+      timestamp: Date.now(),
+      idStatus: MessageStatus.SENDING,
+      version: '2.0',
+      idParent: parentId || null,
+      read: null,
+      expiryDatetime: null,
+      lastModified: null,
+    };
+    if (replaceMessageId) {
+      store.swapMessage(roomId, replaceMessageId, message);
+      await messageRepository.delete(replaceMessageId);
+    } else {
+      store.addMessage(roomId, message);
+    }
+    await messageRepository.create(message);
+
+    // 2. Generate thumbnail (large for local UI, micro for WS payload)
+    if (!imagePayload.thumbnail) {
+      try {
+        const thumbnail = await generateThumbnailFromBase64(
+          imagePayload.base64,
+          imagePayload.mimeType
+        );
+        if (thumbnail) imagePayload.thumbnail = thumbnail;
+      } catch (error) {
+        logger.warn('[ChatService] Persistent: thumbnail generation failed:', error);
+      }
+    }
+
+    // 3. Save original image to filesystem
+    const filePath = await saveImageToFile(imagePayload.base64, generateUUID(), imagePayload.mimeType);
+
+    // 4. Update body with filePath + thumbnail (replaces base64 in store/DB)
+    const updatedBody = JSON.stringify({
+      filePath,
+      thumbnail: imagePayload.thumbnail || '',
+      width: imagePayload.width,
+      height: imagePayload.height,
+      mimeType: imagePayload.mimeType,
+    });
+    await messageRepository.updateBody(envelopeId, updatedBody);
+    store.updateMessage(roomId, envelopeId, { body: updatedBody });
+
+    // 5-9 in messageQueue (serialized)
+    let finalStatus: MessageStatusType = MessageStatus.SENDING;
+    const sendOp = async () => {
+      try {
+        // 4. AES encrypt image (native platform crypto, works with base64 directly)
+        const { encryptedBase64, keyBase64, ivBase64 } = await mediaCryptoService.encrypt(imagePayload.base64);
+
+        // 5. Upload to server
+        const api = serverRegistry.getApiForRoom(roomId);
+        const backendRoomId = toBackendRoomId(roomId);
+        const uploadResult = await api.uploadMedia(
+          backendRoomId,
+          encryptedBase64,
+          imagePayload.mimeType || 'image/jpeg'
+        );
+
+        // 6. Create envelope
+        const persistentPayload: PersistentImagePayload = {
+          mediaId: uploadResult.mediaId,
+          mediaKey: keyBase64,
+          iv: ivBase64,
+          thumbnail: imagePayload.thumbnail || '',
+          mimeType: imagePayload.mimeType || 'image/jpeg',
+          width: imagePayload.width || 0,
+          height: imagePayload.height || 0,
+          size: imagePayload.size || 0,
+        };
+
+        const envelope = MessageEnvelopeFactory.createPersistentImageMessage(
+          roomId, userId, persistentPayload, { id_parent: parentId, encrypted: true }
+        );
+        envelope.id = envelopeId;
+
+        // 7. Signal encrypt + send
+        const payloadString = JSON.stringify(envelope.payload);
+        const encryptedData = await this.encrypt(roomId, payloadString);
+        const serverUserId = serverRegistry.getUserIdForRoom(roomId) || userId;
+        const bkRoomId = toBackendRoomId(roomId);
+
+        let serverBody: any;
+        let category = envelope.category;
+
+        if (encryptedData.senderKey) {
+          category = 'senderkey_message' as const;
+          serverBody = {
+            id: envelope.id,
+            timestamp: envelope.timestamp,
+            category: 'senderkey_message',
+            type: envelope.type,
+            payload: {
+              ciphertext: encryptedData.ciphertext,
+              distributionId: encryptedData.distributionId,
+            },
+            id_room: bkRoomId,
+            id_user_from: serverUserId,
+            version: '2.0',
+            id_parent: envelope.id_parent,
+          };
+        } else {
+          serverBody = {
+            ...envelope,
+            id_room: bkRoomId,
+            id_user_from: serverUserId,
+            payload: { body: encryptedData.message },
+          };
+        }
+
+        const socket = serverRegistry.getSocketForRoom(roomId);
+        const result = await socket.sendMessage(bkRoomId, serverBody, category, envelope.type);
+
+        if (result?.success) {
+          await messageRepository.updateStatus(envelopeId, MessageStatus.SENT);
+          store.updateMessage(roomId, envelopeId, { idStatus: MessageStatus.SENT });
+          this.updateRoomAfterMessage(roomId, JSON.stringify(persistentPayload), envelope.type);
+          finalStatus = MessageStatus.SENT;
+        } else {
+          throw new Error(result?.error || 'Send failed');
+        }
+      } catch (error: any) {
+        logger.error('[ChatService] sendPersistentImage error:', error?.message || error);
+        await messageRepository.updateStatus(envelopeId, MessageStatus.FAILED);
+        store.updateMessage(roomId, envelopeId, { idStatus: MessageStatus.FAILED });
+        finalStatus = MessageStatus.FAILED;
+      }
+    };
+
+    this.messageQueue = this.messageQueue.then(sendOp).catch((e) => {
+      logger.error('[ChatService] sendPersistentImage queue error:', e);
+    });
+    await this.messageQueue;
+
+    return { messageId: envelopeId, status: finalStatus };
+  }
+
+  /**
+   * Send an ephemeral (self-destructing) image message.
+   * The image is AES-encrypted and uploaded to the server with ephemeral flag.
+   * The receiver must tap to view — the image is downloaded once, decrypted in
+   * memory, shown inside a SecureView with a countdown timer, then destroyed.
+   */
+  async sendEphemeralImageMessage(
+    roomId: number,
+    imagePayload: ImageMessagePayload,
+    viewDuration: number,
+    ttlHours: number,
+    parentId?: string
+  ): Promise<SendResult> {
+    const userId = useAuthStore.getState().userId;
+    if (!userId) throw new Error('Not authenticated');
+
+    const envelopeId = generateUUID();
+
+    // Generate a blurred thumbnail for the "tap to view" placeholder
+    let blurThumbnail = '';
+    try {
+      blurThumbnail = await generateColorPreviewFromBase64(
+        imagePayload.base64,
+        imagePayload.mimeType,
+      );
+    } catch (error) {
+      logger.warn('[ChatService] Ephemeral: blur thumbnail generation failed:', error);
+    }
+
+    // Optimistic body for sender — only thumbnail blur, no image data
+    const senderBody = JSON.stringify({
+      thumbnail: blurThumbnail,
+      viewDuration,
+      width: imagePayload.width,
+      height: imagePayload.height,
+      mimeType: imagePayload.mimeType,
+    });
+
+    const store = useChatStore.getState();
+    const message: Message = {
+      id: envelopeId,
+      type: UserMessageType.EPHEMERAL_IMAGE,
+      body: senderBody,
+      encryptedBody: '',
+      idRoom: roomId,
+      idUserFrom: userId,
+      idUserTo: 0,
+      timestamp: Date.now(),
+      idStatus: MessageStatus.SENDING,
+      version: '2.0',
+      idParent: parentId || null,
+      read: null,
+      expiryDatetime: null,
+      lastModified: null,
+    };
+    store.addMessage(roomId, message);
+    await messageRepository.create(message);
+
+    let finalStatus: MessageStatusType = MessageStatus.SENDING;
+    const sendOp = async () => {
+      try {
+        // AES encrypt image
+        const { encryptedBase64, keyBase64, ivBase64 } = await mediaCryptoService.encrypt(imagePayload.base64);
+
+        // Upload to server with ephemeral flag
+        const api = serverRegistry.getApiForRoom(roomId);
+        const backendRoomId = toBackendRoomId(roomId);
+        const uploadResult = await api.uploadEphemeralMedia(
+          backendRoomId,
+          encryptedBase64,
+          imagePayload.mimeType || 'image/jpeg',
+          ttlHours
+        );
+
+        // Build ephemeral payload for Signal-encrypt
+        const ephemeralPayload: EphemeralImagePayload = {
+          mediaId: uploadResult.mediaId,
+          mediaKey: keyBase64,
+          iv: ivBase64,
+          thumbnail: blurThumbnail,
+          mimeType: imagePayload.mimeType || 'image/jpeg',
+          width: imagePayload.width || 0,
+          height: imagePayload.height || 0,
+          size: imagePayload.size || 0,
+          viewDuration,
+        };
+
+        const envelope = MessageEnvelopeFactory.createEphemeralImageMessage(
+          roomId, userId, ephemeralPayload, { id_parent: parentId, encrypted: true }
+        );
+        envelope.id = envelopeId;
+
+        // Signal encrypt + send
+        const payloadString = JSON.stringify(envelope.payload);
+        const encryptedData = await this.encrypt(roomId, payloadString);
+        const serverUserId = serverRegistry.getUserIdForRoom(roomId) || userId;
+        const bkRoomId = toBackendRoomId(roomId);
+
+        let serverBody: any;
+        let category = envelope.category;
+
+        if (encryptedData.senderKey) {
+          category = 'senderkey_message' as const;
+          serverBody = {
+            id: envelope.id,
+            timestamp: envelope.timestamp,
+            category: 'senderkey_message',
+            type: envelope.type,
+            payload: {
+              ciphertext: encryptedData.ciphertext,
+              distributionId: encryptedData.distributionId,
+            },
+            id_room: bkRoomId,
+            id_user_from: serverUserId,
+            version: '2.0',
+            id_parent: envelope.id_parent,
+          };
+        } else {
+          serverBody = {
+            ...envelope,
+            id_room: bkRoomId,
+            id_user_from: serverUserId,
+            payload: { body: encryptedData.message },
+          };
+        }
+
+        const socket = serverRegistry.getSocketForRoom(roomId);
+        const result = await socket.sendMessage(bkRoomId, serverBody, category, envelope.type);
+
+        if (result?.success) {
+          await messageRepository.updateStatus(envelopeId, MessageStatus.SENT);
+          store.updateMessage(roomId, envelopeId, { idStatus: MessageStatus.SENT });
+          this.updateRoomAfterMessage(roomId, JSON.stringify(ephemeralPayload), envelope.type);
+          finalStatus = MessageStatus.SENT;
+        } else {
+          throw new Error(result?.error || 'Send failed');
+        }
+      } catch (error: any) {
+        logger.error('[ChatService] sendEphemeralImage error:', error?.message || error);
+        await messageRepository.updateStatus(envelopeId, MessageStatus.FAILED);
+        store.updateMessage(roomId, envelopeId, { idStatus: MessageStatus.FAILED });
+        finalStatus = MessageStatus.FAILED;
+      }
+    };
+
+    this.messageQueue = this.messageQueue.then(sendOp).catch((e) => {
+      logger.error('[ChatService] sendEphemeralImage queue error:', e);
+    });
+    await this.messageQueue;
+
+    return { messageId: envelopeId, status: finalStatus };
+  }
+
+  // ========================================
+  // FILE / DOCUMENT MESSAGES
+  // ========================================
+
+  /**
+   * Send a generic file (document) message.
+   * The file is read from disk, AES-encrypted client-side, uploaded to /media
+   * (persistent or ephemeral), and a Signal-encrypted envelope is dispatched
+   * with `type: 'file'` and a body containing the metadata + decryption keys.
+   */
+  async sendFileMessage(
+    roomId: number,
+    file: { uri: string; name: string; mimeType: string; size: number },
+    options: { ephemeral?: boolean; ttlHours?: number; parentId?: string; replaceMessageId?: string } = {}
+  ): Promise<SendResult> {
+    const userId = useAuthStore.getState().userId;
+    if (!userId) throw new Error('Not authenticated');
+
+    if (file.size > MAX_FILE_SIZE) {
+      throw new Error('File exceeds maximum allowed size');
+    }
+
+    const { ephemeral = false, ttlHours = 24, parentId, replaceMessageId } = options;
+    const envelopeId = generateUUID();
+
+    // Persist the source bytes into the chat-files cache up-front. The share
+    // extension drops files into a transient AppGroup container that may not
+    // survive a retry; copying now guarantees the bubble can re-share/resend
+    // the file later even if the upload fails.
+    let cachedPath = '';
+    try {
+      const sourceBase64 = await readFileAsBase64(file.uri);
+      cachedPath = saveFileToCache(sourceBase64, envelopeId, file.name);
+    } catch (err) {
+      logger.warn('[ChatService] sendFile: pre-cache failed, falling back to sourceUri:', err);
+    }
+
+    // Optimistic: keep both filePath (stable cache) and sourceUri (best-effort
+    // original) so the sender can preview/share immediately.
+    const optimisticBody = JSON.stringify({
+      fileName: file.name,
+      fileSize: file.size,
+      mimeType: file.mimeType,
+      sourceUri: file.uri,
+      filePath: cachedPath || undefined,
+      ephemeral,
+    });
+
+    const store = useChatStore.getState();
+    const message: Message = {
+      id: envelopeId,
+      type: UserMessageType.FILE,
+      body: optimisticBody,
+      encryptedBody: '',
+      idRoom: roomId,
+      idUserFrom: userId,
+      idUserTo: 0,
+      timestamp: Date.now(),
+      idStatus: MessageStatus.SENDING,
+      version: '2.0',
+      idParent: parentId || null,
+      read: null,
+      expiryDatetime: null,
+      lastModified: null,
+    };
+    if (replaceMessageId) {
+      store.swapMessage(roomId, replaceMessageId, message);
+      await messageRepository.delete(replaceMessageId);
+    } else {
+      store.addMessage(roomId, message);
+    }
+    await messageRepository.create(message);
+
+    let finalStatus: MessageStatusType = MessageStatus.SENDING;
+    const sendOp = async () => {
+      try {
+        // 1. Read file as base64. Prefer the cache (stable) over the original
+        // sourceUri, which may have been wiped by the share extension.
+        const readPath = cachedPath || file.uri;
+        const base64 = await readFileAsBase64(readPath);
+
+        // 2. AES-256-GCM encrypt
+        const { encryptedBase64, keyBase64, ivBase64 } = await mediaCryptoService.encrypt(base64);
+
+        // 4. Upload (persistent or ephemeral)
+        const api = serverRegistry.getApiForRoom(roomId);
+        const backendRoomId = toBackendRoomId(roomId);
+        const uploadResult = ephemeral
+          ? await api.uploadEphemeralMedia(backendRoomId, encryptedBase64, file.mimeType, ttlHours)
+          : await api.uploadMedia(backendRoomId, encryptedBase64, file.mimeType);
+
+        // 5. Build envelope payload
+        const filePayload: FileMessagePayload = {
+          mediaId: uploadResult.mediaId,
+          mediaKey: keyBase64,
+          iv: ivBase64,
+          fileName: file.name,
+          fileSize: file.size,
+          mimeType: file.mimeType,
+          ephemeral,
+          expiresAt: uploadResult.expiresAt,
+        };
+
+        const envelope = MessageEnvelopeFactory.createFileMessage(
+          roomId, userId, filePayload, { id_parent: parentId, encrypted: true }
+        );
+        envelope.id = envelopeId;
+
+        // 6. Update local body to the persisted shape (drop optimistic sourceUri,
+        // add cached filePath if available). Sender keeps the file accessible.
+        const updatedBody = JSON.stringify({
+          ...filePayload,
+          filePath: cachedPath,
+        });
+        await messageRepository.updateBody(envelopeId, updatedBody);
+        store.updateMessage(roomId, envelopeId, { body: updatedBody });
+
+        // 7. Signal encrypt + send
+        const payloadString = JSON.stringify(envelope.payload);
+        const encryptedData = await this.encrypt(roomId, payloadString);
+        const serverUserId = serverRegistry.getUserIdForRoom(roomId) || userId;
+        const bkRoomId = toBackendRoomId(roomId);
+
+        let serverBody: any;
+        let category = envelope.category;
+
+        if (encryptedData.senderKey) {
+          category = 'senderkey_message' as const;
+          serverBody = {
+            id: envelope.id,
+            timestamp: envelope.timestamp,
+            category: 'senderkey_message',
+            type: envelope.type,
+            payload: {
+              ciphertext: encryptedData.ciphertext,
+              distributionId: encryptedData.distributionId,
+            },
+            id_room: bkRoomId,
+            id_user_from: serverUserId,
+            version: '2.0',
+            id_parent: envelope.id_parent,
+          };
+        } else {
+          serverBody = {
+            ...envelope,
+            id_room: bkRoomId,
+            id_user_from: serverUserId,
+            payload: { body: encryptedData.message },
+          };
+        }
+
+        const socket = serverRegistry.getSocketForRoom(roomId);
+        const result = await socket.sendMessage(bkRoomId, serverBody, category, envelope.type);
+
+        if (result?.success) {
+          await messageRepository.updateStatus(envelopeId, MessageStatus.SENT);
+          store.updateMessage(roomId, envelopeId, { idStatus: MessageStatus.SENT });
+          this.updateRoomAfterMessage(roomId, updatedBody, envelope.type);
+          finalStatus = MessageStatus.SENT;
+        } else {
+          throw new Error(result?.error || 'Send failed');
+        }
+      } catch (error: any) {
+        logger.error('[ChatService] sendFileMessage error:', error?.message || error);
+        await messageRepository.updateStatus(envelopeId, MessageStatus.FAILED);
+        store.updateMessage(roomId, envelopeId, { idStatus: MessageStatus.FAILED });
+        finalStatus = MessageStatus.FAILED;
+      }
+    };
+
+    this.messageQueue = this.messageQueue.then(sendOp).catch((e) => {
+      logger.error('[ChatService] sendFile queue error:', e);
+    });
+    await this.messageQueue;
+
+    return { messageId: envelopeId, status: finalStatus };
+  }
+
+  /**
+   * Download an encrypted file blob from the media endpoint, decrypt with the
+   * provided AES-GCM key/iv, and persist the plaintext into the chat-files
+   * cache. Returns the relative path so the caller can update the message body.
+   */
+  async downloadAndDecryptFile(
+    messageId: string,
+    roomId: number,
+    payload: FileMessagePayload,
+  ): Promise<string> {
+    const api = serverRegistry.getApiForRoom(roomId);
+    const encryptedArrayBuffer = await api.downloadMedia(payload.mediaId);
+
+    const bytes = new Uint8Array(encryptedArrayBuffer);
+    let binary = '';
+    for (let i = 0; i < bytes.byteLength; i++) {
+      binary += String.fromCharCode(bytes[i]);
+    }
+    const encryptedBase64 = btoa(binary);
+
+    const decryptedBase64 = await mediaCryptoService.decrypt(
+      encryptedBase64,
+      payload.mediaKey,
+      payload.iv,
+    );
+
+    const cachedPath = saveFileToCache(decryptedBase64, messageId, payload.fileName);
+
+    const updatedBody = JSON.stringify({
+      mediaId: payload.mediaId,
+      mediaKey: payload.mediaKey,
+      iv: payload.iv,
+      fileName: payload.fileName,
+      fileSize: payload.fileSize,
+      mimeType: payload.mimeType,
+      ephemeral: payload.ephemeral || false,
+      expiresAt: payload.expiresAt,
+      filePath: cachedPath,
+    });
+
+    await messageRepository.updateBody(messageId, updatedBody);
+    useChatStore.getState().updateMessage(roomId, messageId, { body: updatedBody });
+
+    return cachedPath;
+  }
+
+  /**
+   * Resend an image message (FAILED or UNDELIVERED) with a chosen mode.
+   * Deletes the old message, then sends a fresh one.
+   */
+  async resendMessage(
+    roomId: number,
+    messageId: string,
+    mode: 'volatile' | 'persistent'
+  ): Promise<void> {
+    const message = await messageRepository.findById(messageId);
+    if (!message) throw new Error('Message not found');
+
+    let parsed: any;
+    try {
+      parsed = JSON.parse(message.body);
+    } catch {
+      throw new Error('Cannot parse image data');
+    }
+
+    let base64: string;
+    if (parsed.filePath) {
+      base64 = await readImageAsBase64(parsed.filePath);
+    } else if (parsed.base64) {
+      base64 = parsed.base64;
+    } else {
+      throw new Error('Image data not available');
+    }
+
+    const imagePayload: ImageMessagePayload = {
+      base64,
+      thumbnail: parsed.thumbnail || '',
+      mimeType: parsed.mimeType || 'image/jpeg',
+      width: parsed.width || 0,
+      height: parsed.height || 0,
+      size: parsed.size || 0,
+    };
+
+    // Resend with chosen mode — atomic swap prevents scroll position disruption
+    if (mode === 'persistent') {
+      await this.sendPersistentImageMessage(roomId, imagePayload, message.idParent || undefined, messageId);
+    } else {
+      await this.sendImageMessage(roomId, imagePayload, message.idParent || undefined, messageId);
+    }
+  }
+
+  /**
+   * Resend a text message (FAILED or UNDELIVERED).
+   * Deletes the old message, then sends a fresh one.
+   */
+  async resendTextMessage(roomId: number, messageId: string): Promise<void> {
+    const message = await messageRepository.findById(messageId);
+    if (!message) throw new Error('Message not found');
+
+    const body = message.body;
+    const parentId = message.idParent || undefined;
+
+    // Resend — atomic swap prevents scroll position disruption
+    await this.sendMessage(roomId, body, parentId, messageId);
+  }
+
+  /**
+   * Resend a generic file message (FAILED or UNDELIVERED).
+   * The local cache (`filePath`) is the source of truth — the original
+   * `sourceUri` from the share extension may already be gone. We rebuild
+   * a file descriptor from the cached blob and re-run sendFileMessage.
+   */
+  async resendFileMessage(roomId: number, messageId: string): Promise<void> {
+    const message = await messageRepository.findById(messageId);
+    if (!message) throw new Error('Message not found');
+
+    let parsed: any;
+    try {
+      parsed = JSON.parse(message.body);
+    } catch {
+      throw new Error('Cannot parse file message body');
+    }
+
+    let uri: string | null = null;
+    if (parsed.filePath && fileExists(parsed.filePath)) {
+      uri = resolveFilePath(parsed.filePath);
+    } else if (parsed.sourceUri) {
+      // Last resort: the original share-extension URI. May fail if cleaned up.
+      uri = parsed.sourceUri;
+    }
+
+    if (!uri) throw new Error('File data not available for resend');
+
+    const fileName: string = parsed.fileName || 'file';
+    const mimeType: string = parsed.mimeType || 'application/octet-stream';
+    const fileSize: number = typeof parsed.fileSize === 'number' ? parsed.fileSize : 0;
+    const ephemeral: boolean = !!parsed.ephemeral;
+    const parentId = message.idParent || undefined;
+
+    await this.sendFileMessage(
+      roomId,
+      { uri, name: fileName, mimeType, size: fileSize },
+      { ephemeral, parentId, replaceMessageId: messageId }
+    );
+  }
+
+  private async sendEnvelope(
+    envelope: MessageEnvelope,
+    plainBody: string,
+    options?: { skipOptimistic?: boolean; localId?: string; replaceMessageId?: string }
+  ): Promise<SendResult> {
+    const store = useChatStore.getState();
+    const roomId = envelope.id_room;
+
+    // Determine if the room uses sender keys — sender key messages get a
+    // temporary local ID because the server generates the final UUID.
+    const room = await roomRepository.findById(roomId);
+    const isSenderKeyRoom = room?.useSenderKeys === 1;
+    const localId = options?.localId ?? (isSenderKeyRoom ? generateLocalId() : envelope.id);
+    let finalStatus: MessageStatusType = MessageStatus.SENDING;
+
+    if (!options?.skipOptimistic) {
+      const message: Message = {
+        id: localId,
+        type: envelope.type,
+        body: plainBody,
+        encryptedBody: '',
+        idRoom: roomId,
+        idUserFrom: envelope.id_user_from,
+        idUserTo: envelope.id_user_to || 0,
+        timestamp: envelope.timestamp,
+        idStatus: MessageStatus.SENDING,
+        version: '2.0',
+        idParent: envelope.id_parent || null,
+        read: null,
+        expiryDatetime: null,
+        lastModified: null,
+      };
+
+      if (options?.replaceMessageId) {
+        store.swapMessage(roomId, options.replaceMessageId, message);
+        await messageRepository.delete(options.replaceMessageId);
+      } else {
+        store.addMessage(roomId, message);
+      }
+      await messageRepository.create(message);
+    }
+
+    const sendOperation = async () => {
+      let serverBody: any = null;
+      let category = envelope.category;
+      const isVolatileImage = envelope.type === UserMessageType.IMAGE;
+
+      try {
+        const payloadString = JSON.stringify(envelope.payload);
+        const encryptedData = await this.encrypt(roomId, payloadString);
+
+        const backendRoomId = toBackendRoomId(roomId);
+
+        // Use server-specific user ID for outgoing messages (different per server)
+        const serverUserId = serverRegistry.getUserIdForRoom(roomId) || envelope.id_user_from;
+
+        if (encryptedData.senderKey) {
+          category = 'senderkey_message' as const;
+          serverBody = {
+            id: localId,
+            timestamp: envelope.timestamp,
+            category: 'senderkey_message',
+            type: envelope.type,
+            payload: {
+              ciphertext: encryptedData.ciphertext,
+              distributionId: encryptedData.distributionId,
+            },
+            id_room: backendRoomId,
+            id_user_from: serverUserId,
+            version: envelope.version || '2.0',
+            id_parent: envelope.id_parent,
+          };
+        } else {
+          serverBody = {
+            ...envelope,
+            id_room: backendRoomId,
+            id_user_from: serverUserId,
+            payload: { body: encryptedData.message },
+          };
+        }
+
+        // Mark volatile images so the server won't queue for offline recipients
+        if (isVolatileImage) {
+          serverBody.volatile = true;
+        }
+
+        const socket = serverRegistry.getSocketForRoom(roomId);
+        logger.info('[ChatService] sendEnvelope: sending message', localId, 'to room', backendRoomId, 'volatile:', isVolatileImage, 'senderKey:', !!encryptedData.senderKey);
+        const result = await socket.sendMessage(backendRoomId, serverBody, category, envelope.type);
+        logger.info('[ChatService] sendEnvelope: socket result for', localId, ':', JSON.stringify(result));
+
+        if (result?.success) {
+          // Determine effective status: volatile images not delivered → UNDELIVERED
+          const effectiveStatus = isVolatileImage && !result.delivered
+            ? MessageStatus.UNDELIVERED
+            : MessageStatus.SENT;
+
+          if (isSenderKeyRoom && result.messageId) {
+            // Server assigned a new UUID — replace the local ID
+            const serverTimestamp = result.timestamp ? Number(result.timestamp) : undefined;
+            await messageRepository.replaceId(localId, result.messageId, serverTimestamp);
+            // replaceId doesn't update idStatus — set it explicitly
+            await messageRepository.updateStatus(result.messageId, effectiveStatus);
+            store.replaceMessageId(roomId, localId, result.messageId, {
+              idStatus: effectiveStatus,
+              ...(serverTimestamp ? { timestamp: serverTimestamp } : {}),
+            });
+          } else {
+            await messageRepository.updateStatus(localId, effectiveStatus);
+            store.updateMessage(roomId, localId, { idStatus: effectiveStatus });
+          }
+          finalStatus = effectiveStatus;
+          this.updateRoomAfterMessage(roomId, plainBody, envelope.type);
+        } else {
+          throw new Error(result?.error || 'Send failed - no success in response');
+        }
+      } catch (error: any) {
+        logger.error('[ChatService] sendEnvelope error for', localId, ':', error?.message || error);
+
+        const isTimeout = error?.message?.includes('timeout');
+        const isNotConnected = error?.message?.includes('not connected');
+
+        if (isTimeout) {
+          logger.warn('[ChatService] Message', localId, 'timed out - keeping as SENDING');
+        } else if (isNotConnected && serverBody) {
+          logger.info('[ChatService] Not connected, queueing encrypted message', localId);
+          queueService.addMessage(serverBody, {
+            onSuccess: async (result: any) => {
+              const queueEffectiveStatus = isVolatileImage && !result?.delivered
+                ? MessageStatus.UNDELIVERED
+                : MessageStatus.SENT;
+
+              if (result?.messageId && localId.startsWith('local_')) {
+                const serverTimestamp = result.timestamp ? Number(result.timestamp) : undefined;
+                await messageRepository.replaceId(localId, result.messageId, serverTimestamp);
+                await messageRepository.updateStatus(result.messageId, queueEffectiveStatus);
+                store.replaceMessageId(roomId, localId, result.messageId, {
+                  idStatus: queueEffectiveStatus,
+                  ...(serverTimestamp ? { timestamp: serverTimestamp } : {}),
+                });
+              } else {
+                await messageRepository.updateStatus(localId, queueEffectiveStatus);
+                store.updateMessage(roomId, localId, { idStatus: queueEffectiveStatus });
+              }
+            },
+            onError: async () => {
+              await messageRepository.updateStatus(localId, MessageStatus.FAILED);
+              store.updateMessage(roomId, localId, { idStatus: MessageStatus.FAILED });
+            },
+          });
+        } else {
+          logger.error('[ChatService] Message', localId, 'failed:', error?.message);
+          await messageRepository.updateStatus(localId, MessageStatus.FAILED);
+          store.updateMessage(roomId, localId, { idStatus: MessageStatus.FAILED });
+          finalStatus = MessageStatus.FAILED;
+        }
+      }
+    };
+
+    this.messageQueue = this.messageQueue
+      .then(sendOperation)
+      .catch((error) => {
+        logger.error('[ChatService] sendEnvelope queue error:', error);
+      });
+    await this.messageQueue;
+
+    return { messageId: localId, status: finalStatus };
+  }
+
+  // ========================================
+  // CONTROL PACKET SENDING
+  // ========================================
+
+  async sendControlPacket(
+    roomId: number,
+    type: ControlPacketTypeValue,
+    payload: any,
+    toUserId?: number,
+    options?: { inline?: boolean }
+  ): Promise<void> {
+    const userId = useAuthStore.getState().userId;
+    if (!userId) {
+      logger.warn('[ChatService] sendControlPacket: no userId, skipping');
+      return;
+    }
+
+    const envelope = MessageEnvelopeFactory.createControlPacket(roomId, userId, type, payload);
+    logger.info(`[ChatService][User:${userId}] sendControlPacket: ${type} id: ${envelope.id} room: ${roomId} to: ${toUserId} inline: ${!!options?.inline}`);
+
+    const sendOperation = async () => {
+      logger.info(`[ChatService][User:${userId}] sendControlPacket EXECUTING: ${type} id: ${envelope.id}`);
+      if (envelope.encrypted) {
+        try {
+          const encrypted = await this.encrypt(roomId, JSON.stringify(payload));
+          if (encrypted.senderKey) {
+            envelope.payload = {
+              ciphertext: encrypted.ciphertext,
+              distributionId: encrypted.distributionId,
+            };
+          } else if (encrypted.message) {
+            envelope.payload = { body: encrypted.message };
+          }
+          logger.info('[ChatService] sendControlPacket: encrypted OK, senderKey:', !!encrypted.senderKey);
+        } catch (error) {
+          logger.error('[ChatService] Control packet encryption failed, dropping packet:', error);
+          return;
+        }
+      } else {
+        envelope.payload = { body: JSON.stringify(payload) };
+      }
+
+      if (toUserId) {
+        envelope.id_user_to = toUserId;
+      }
+
+      const socket = serverRegistry.getSocketForRoom(roomId);
+      if (!socket.isConnected()) {
+        logger.warn('[ChatService] sendControlPacket: socket NOT connected, dropping packet');
+        return;
+      }
+
+      // Use server-specific user ID for outgoing packets
+      const serverUserId = serverRegistry.getUserIdForRoom(roomId);
+      if (serverUserId) {
+        envelope.id_user_from = serverUserId;
+      }
+
+      const backendRoomId = toBackendRoomId(roomId);
+
+      try {
+        const isVolatile = type === ControlPacketType.TYPING_STARTED || type === ControlPacketType.TYPING_STOPPED;
+        const result = await socket.sendPacket(backendRoomId, envelope, toUserId ? [toUserId] : undefined, isVolatile);
+        logger.info('[ChatService] sendControlPacket: sent, result:', JSON.stringify(result));
+      } catch (error) {
+        logger.error('[ChatService] sendControlPacket error:', error);
+      }
+    };
+
+    if (options?.inline) {
+      // SAFETY: inline must only be called from within the messageQueue chain
+      // (processEnvelope → handleUserMessage, enqueueSignalOperation → joinRoom)
+      // to avoid concurrent Signal Protocol operations.
+      try {
+        await sendOperation();
+      } catch (error) {
+        logger.error('[ChatService] sendControlPacket inline error:', error);
+      }
+    } else {
+      this.messageQueue = this.messageQueue
+        .then(sendOperation)
+        .catch((error) => {
+          logger.error('[ChatService] sendControlPacket queue error:', error);
+        });
+    }
+  }
+
+  // ========================================
+  // TYPING INDICATORS
+  // ========================================
+
+  sendTypingIndicator(roomId: number): void {
+    const now = Date.now();
+    const lastSent = this.typingThrottleMap.get(roomId) || 0;
+    if (now - lastSent < TYPING_THROTTLE_MS) return;
+
+    this.typingThrottleMap.set(roomId, now);
+    this.sendControlPacket(roomId, ControlPacketType.TYPING_STARTED, {}).catch((err) => {
+      logger.warn('[ChatService] sendTypingIndicator error:', err);
+    });
+  }
+
+  sendTypingStopped(roomId: number): void {
+    this.typingThrottleMap.delete(roomId);
+    this.sendControlPacket(roomId, ControlPacketType.TYPING_STOPPED, {}).catch((err) => {
+      logger.warn('[ChatService] sendTypingStopped error:', err);
+    });
+  }
+
+  // ========================================
+  // ROOM MANAGEMENT
+  // ========================================
+
+  async createRoom(
+    name: string,
+    username: string,
+    serverId?: number,
+    administered?: boolean
+  ): Promise<{ roomId: number; inviteCode: string }> {
+    const userId = useAuthStore.getState().userId;
+    if (!userId) throw new Error('Not authenticated');
+
+    const targetServerId = serverId ?? serverRegistry.getDefaultServerId();
+    const api = serverRegistry.getApi(targetServerId);
+
+    const res = await api.createRoom(name, username, administered);
+    const localRoomId = toLocalRoomId(targetServerId, res.roomId);
+
+    await roomRepository.upsert({
+      id: localRoomId,
+      name,
+      inviteCode: res.inviteCode,
+      status: 0,
+      idUser: userId,
+      useSenderKeys: 0,
+      administered: administered ? 1 : 0,
+      serverId: targetServerId,
+    });
+
+    await profileRepository.upsert({
+      idUser: userId,
+      idRoom: localRoomId,
+      username,
+    });
+
+    // Also store profile with server-specific userId
+    const srvUserId = serverRegistry.getUserIdForServer(targetServerId);
+    if (srvUserId && srvUserId !== userId) {
+      await profileRepository.upsert({
+        idUser: srvUserId,
+        idRoom: localRoomId,
+        username,
+      });
+    }
+
+    const store = useChatStore.getState();
+    store.addRoomToList({
+      id: localRoomId,
+      name,
+      inviteCode: res.inviteCode,
+      status: 0,
+      idUser: userId,
+      useSenderKeys: 0,
+      administered: administered ? 1 : 0,
+      serverId: targetServerId,
+      username: null,
+      image: null,
+      age: null,
+      timestampUpdate: null,
+      timestampCreate: Math.floor(Date.now() / 1000),
+      lastModified: Math.floor(Date.now() / 1000),
+      hasSession: false,
+      unreadCount: 0,
+    });
+
+    const socket = serverRegistry.getSocket(targetServerId);
+    await socket.joinRoom(res.roomId);
+
+    return { roomId: localRoomId, inviteCode: res.inviteCode.toUpperCase() };
+  }
+
+  async joinRoom(inviteCode: string, username: string, serverId?: number): Promise<number> {
+    const userId = useAuthStore.getState().userId;
+    if (!userId) throw new Error('Not authenticated');
+
+    const targetServerId = serverId ?? serverRegistry.getDefaultServerId();
+    const api = serverRegistry.getApi(targetServerId);
+
+    const code = inviteCode.trim().toLowerCase();
+    logger.info('[ChatService] joinRoom: calling API with code', code, 'on server', targetServerId);
+    const res = await api.joinRoom(code, username);
+    logger.info('[ChatService] joinRoom: API response', JSON.stringify(res));
+
+    const localRoomId = toLocalRoomId(targetServerId, res.roomId);
+
+    await roomRepository.upsert({
+      id: localRoomId,
+      name: res.name,
+      inviteCode: res.inviteCode,
+      status: res.status ?? 0,
+      idUser: res.id_user,
+      useSenderKeys: res.useSenderKeys ?? 0,
+      administered: res.administered ? 1 : 0,
+      serverId: targetServerId,
+    });
+
+    await profileRepository.upsert({
+      idUser: userId,
+      idRoom: localRoomId,
+      username,
+    });
+
+    // Also store profile with server-specific userId for profile lookups
+    // from other devices (they see us with server-specific ID)
+    const serverUserId = serverRegistry.getUserIdForServer(targetServerId);
+    if (serverUserId && serverUserId !== userId) {
+      await profileRepository.upsert({
+        idUser: serverUserId,
+        idRoom: localRoomId,
+        username,
+      });
+    }
+
+    logger.info('[ChatService] joinRoom: fetching members for room', res.roomId, 'on server', targetServerId);
+    const members = await api.getRoomMembers(res.roomId);
+    const serverUserId2 = serverRegistry.getUserIdForServer(targetServerId);
+    logger.info('[ChatService] joinRoom: found', members.length, 'members, serverUserId:', serverUserId2, 'globalUserId:', userId);
+    for (const m of members) {
+      logger.info('[ChatService] joinRoom: member:', JSON.stringify({ id_user: m.id_user, username: m.username }));
+    }
+
+    const hasSession = await this.enqueueSignalOperation(async () => {
+      let anySession = false;
+
+      for (const member of members) {
+        try {
+          logger.info('[ChatService] joinRoom: establishing session with member', member.id_user, 'in room', localRoomId);
+          const success = await sessionService.setSession(
+            localRoomId,
+            member.id_user,
+            member.username || `user-${member.id_user}`,
+            1
+          );
+          logger.info('[ChatService] joinRoom: setSession result for member', member.id_user, ':', success);
+          if (success) anySession = true;
+
+          await profileRepository.upsert({
+            idUser: member.id_user,
+            idRoom: localRoomId,
+            username: member.username || `user-${member.id_user}`,
+          });
+        } catch (error) {
+          logger.error('[ChatService] Session with member failed:', member.id_user, error);
+        }
+      }
+
+      // Verify sessions in DB after establishment
+      const sessionsInDb = await sessionRepository.findByRoom(localRoomId);
+      logger.info('[ChatService] joinRoom: sessions done, hasSession:', anySession, 'sessionsInDb:', sessionsInDb.length,
+        'sessionDetails:', sessionsInDb.map(s => ({ idUser: s.idUser, idRoom: s.idRoom })));
+
+      // Notify existing members so they can establish the reverse session.
+      // This is a targeted packet — the decrypt on the receiver's side
+      // auto-establishes the session via PreKeySignalMessage (X3DH).
+      for (const member of members) {
+        try {
+          await this.sendControlPacket(
+            localRoomId,
+            ControlPacketType.SESSION_ESTABLISHED,
+            { timestamp: Date.now(), username },
+            member.id_user,
+            { inline: true }
+          );
+        } catch (error) {
+          logger.warn('[ChatService] Failed to notify member:', member.id_user, error);
+        }
+      }
+
+      const totalMembers = members.length + 1;
+      if (totalMembers >= SENDER_KEY_THRESHOLD) {
+        try {
+          await senderKeyService.fetchAndProcessPendingSenderKeys(localRoomId);
+          await senderKeyService.initializeSenderKeysIfNeeded(localRoomId);
+        } catch (error) {
+          logger.error('[ChatService] Sender key setup failed:', error);
+        }
+      }
+
+      return anySession;
+    });
+
+    logger.info('[ChatService] joinRoom: adding room to store, id:', localRoomId, 'name:', res.name);
+    const store = useChatStore.getState();
+    store.addRoomToList({
+      id: localRoomId,
+      name: res.name,
+      inviteCode: res.inviteCode,
+      status: 0,
+      idUser: res.id_user,
+      useSenderKeys: res.useSenderKeys ?? 0,
+      administered: res.administered ? 1 : 0,
+      serverId: targetServerId,
+      username: null,
+      image: null,
+      age: null,
+      timestampUpdate: null,
+      timestampCreate: Math.floor(Date.now() / 1000),
+      lastModified: Math.floor(Date.now() / 1000),
+      hasSession,
+      unreadCount: 0,
+    });
+
+    const socket = serverRegistry.getSocket(targetServerId);
+    await socket.joinRoom(res.roomId);
+
+    logger.info('[ChatService] joinRoom: complete, store allRooms:', useChatStore.getState().allRooms.length);
+
+    return localRoomId;
+  }
+
+  async deleteRoom(roomId: number): Promise<'deleted' | 'left'> {
+    const api = serverRegistry.getApiForRoom(roomId);
+    const backendRoomId = toBackendRoomId(roomId);
+
+    let action: 'deleted' | 'left' = 'deleted';
+    try {
+      const res = await api.deleteRoom(backendRoomId);
+      if (res?.action === 'left') action = 'left';
+    } catch (error: any) {
+      const status = error?.response?.status;
+      if (status === 404) {
+        logger.info('[ChatService] deleteRoom: room already deleted on server, proceeding with local cleanup');
+      } else {
+        throw error;
+      }
+    }
+
+    await this.performLocalRoomCleanup(roomId);
+    return action;
+  }
+
+  async deleteMessageForEveryone(roomId: number, messageId: string): Promise<void> {
+    const userId = useAuthStore.getState().userId;
+    if (!userId) throw new Error('Not authenticated');
+
+    const message = await messageRepository.findById(messageId);
+    if (!message) throw new Error('Message not found');
+
+    const api = serverRegistry.getApiForRoom(roomId);
+    const backendRoomId = toBackendRoomId(roomId);
+    await api.deleteMessage(backendRoomId, messageId);
+
+    if (message.type === UserMessageType.IMAGE || message.type === UserMessageType.PERSISTENT_IMAGE || message.type === UserMessageType.EPHEMERAL_IMAGE) {
+      deleteImagesByMessageIds([messageId]);
+    }
+
+    if (message.type === UserMessageType.PERSISTENT_IMAGE || message.type === UserMessageType.EPHEMERAL_IMAGE) {
+      try {
+        const parsed = JSON.parse(message.body);
+        if (parsed.mediaId) {
+          const mediaApi = serverRegistry.getApiForRoom(roomId);
+          await mediaApi.deleteMedia(parsed.mediaId);
+        }
+      } catch (e) {
+        logger.warn('[ChatService] deleteMedia failed (non-critical):', e);
+      }
+    }
+
+    await messageRepository.delete(messageId);
+    useChatStore.getState().removeMessage(roomId, messageId);
+    await this.refreshRoomLastMessage(roomId);
+  }
+
+  // ========================================
+  // RECEIPTS
+  // ========================================
+
+  async sendReadReceipt(roomId: number, messageId: string, toUserId: number): Promise<void> {
+    await this.sendControlPacket(
+      roomId,
+      ControlPacketType.MESSAGE_READ,
+      { id_message: messageId },
+      toUserId
+    );
+  }
+
+  async markRoomAsRead(roomId: number): Promise<number> {
+    const userId = useAuthStore.getState().userId;
+    if (!userId) return 0;
+
+    const messages = useChatStore.getState().messages.get(roomId) || [];
+    const unread = messages.filter(
+      (m) => m.idUserFrom !== userId && m.idStatus !== MessageStatus.READ
+    );
+
+    if (unread.length === 0) return 0;
+
+    for (const msg of unread) {
+      try {
+        await this.sendReadReceipt(roomId, msg.id, msg.idUserFrom);
+        await messageRepository.markAsRead(msg.id);
+        useChatStore.getState().updateMessage(roomId, msg.id, { idStatus: MessageStatus.READ });
+      } catch (error) {
+        logger.error('[ChatService] Failed to send read receipt for:', msg.id);
+      }
+    }
+
+    useChatStore.getState().updateRoomInList(roomId, { unreadCount: 0 });
+
+    return unread.length;
+  }
+
+  // ========================================
+  // RECOVERY
+  // ========================================
+
+  async recoverStuckMessages(): Promise<void> {
+    const MAX_RETRY_AGE_MS = 2 * 60 * 60 * 1000;
+    const cutoff = Date.now() - MAX_RETRY_AGE_MS;
+
+    try {
+      const stuck = await messageRepository.findStuckSending();
+      let expired = 0;
+      let retryable = 0;
+
+      for (const msg of stuck) {
+        if (msg.timestamp < cutoff) {
+          await messageRepository.updateStatus(msg.id, MessageStatus.FAILED);
+          expired++;
+        } else {
+          retryable++;
+        }
+      }
+
+      if (expired > 0 || retryable > 0) {
+        logger.info(
+          `[ChatService] recoverStuckMessages: ${expired} expired -> FAILED, ${retryable} retryable (will retry on connect)`
+        );
+      }
+    } catch (error) {
+      logger.warn('[ChatService] recoverStuckMessages error:', error);
+    }
+  }
+
+  private async retrySendingMessages(): Promise<void> {
+    const MAX_RETRY_AGE_MS = 2 * 60 * 60 * 1000;
+    const cutoff = Date.now() - MAX_RETRY_AGE_MS;
+
+    const stuck = await messageRepository.findStuckSending();
+    const retryable = stuck.filter((m) => m.timestamp >= cutoff);
+    if (retryable.length === 0) return;
+
+    logger.info(`[ChatService] Retrying ${retryable.length} stuck messages...`);
+
+    for (const msg of retryable) {
+      await this.retryMessageSend(msg);
+    }
+  }
+
+  private async retryMessageSend(msg: Message): Promise<void> {
+    const store = useChatStore.getState();
+    const isLocalId = msg.id.startsWith('local_');
+
+    const retryOp = async () => {
+      try {
+        const payload = this.reconstructPayload(msg.type, msg.body);
+        const payloadString = JSON.stringify(payload);
+
+        const encryptedData = await this.encrypt(msg.idRoom, payloadString);
+        const backendRoomId = toBackendRoomId(msg.idRoom);
+
+        let serverBody: any;
+        let category: string;
+
+        const retryIsVolatileImage = msg.type === UserMessageType.IMAGE;
+
+        if (encryptedData.senderKey) {
+          category = 'senderkey_message';
+          serverBody = {
+            id: msg.id,
+            timestamp: msg.timestamp,
+            category: 'senderkey_message',
+            type: msg.type,
+            payload: {
+              ciphertext: encryptedData.ciphertext,
+              distributionId: encryptedData.distributionId,
+            },
+            id_room: backendRoomId,
+            id_user_from: msg.idUserFrom,
+            version: msg.version || '2.0',
+            id_parent: msg.idParent,
+          };
+        } else {
+          category = 'user';
+          serverBody = {
+            id: msg.id,
+            timestamp: msg.timestamp,
+            category: 'user',
+            type: msg.type,
+            payload: { body: encryptedData.message },
+            id_room: backendRoomId,
+            id_user_from: msg.idUserFrom,
+            encrypted: true,
+            version: msg.version || '2.0',
+            id_parent: msg.idParent,
+          };
+        }
+
+        // Mark volatile images so the server won't queue for offline recipients
+        if (retryIsVolatileImage) {
+          serverBody.volatile = true;
+        }
+
+        const socket = serverRegistry.getSocketForRoom(msg.idRoom);
+        const result = await socket.sendMessage(backendRoomId, serverBody, category, msg.type);
+
+        if (result?.success) {
+          const retryEffectiveStatus = retryIsVolatileImage && !result.delivered
+            ? MessageStatus.UNDELIVERED
+            : MessageStatus.SENT;
+
+          if (isLocalId && result.messageId) {
+            const serverTimestamp = result.timestamp ? Number(result.timestamp) : undefined;
+            await messageRepository.replaceId(msg.id, result.messageId, serverTimestamp);
+            await messageRepository.updateStatus(result.messageId, retryEffectiveStatus);
+            store.replaceMessageId(msg.idRoom, msg.id, result.messageId, {
+              idStatus: retryEffectiveStatus,
+              ...(serverTimestamp ? { timestamp: serverTimestamp } : {}),
+            });
+          } else {
+            await messageRepository.updateStatus(msg.id, retryEffectiveStatus);
+            store.updateMessage(msg.idRoom, msg.id, { idStatus: retryEffectiveStatus });
+          }
+          logger.info(`[ChatService] Retry success: ${msg.id}`);
+        } else {
+          throw new Error(result?.error || 'Send failed');
+        }
+      } catch (error: any) {
+        logger.error(`[ChatService] Retry failed for ${msg.id}:`, error?.message || error);
+        await messageRepository.updateStatus(msg.id, MessageStatus.FAILED);
+        store.updateMessage(msg.idRoom, msg.id, { idStatus: MessageStatus.FAILED });
+      }
+    };
+
+    this.messageQueue = this.messageQueue.then(retryOp).catch((error) => {
+      logger.error('[ChatService] retryMessageSend queue error:', error);
+    });
+    await this.messageQueue;
+  }
+
+  private reconstructPayload(type: string, body: string): any {
+    switch (type) {
+      case UserMessageType.TEXT:
+        return { text: body };
+      case UserMessageType.PERSISTENT_IMAGE:
+        try {
+          return JSON.parse(body);
+        } catch {
+          return { text: body };
+        }
+      case UserMessageType.IMAGE:
+      case UserMessageType.EPHEMERAL_IMAGE:
+      case UserMessageType.AUDIO:
+      case UserMessageType.VIDEO:
+      case UserMessageType.FILE:
+      case UserMessageType.LOCATION:
+        try {
+          return JSON.parse(body);
+        } catch {
+          return { text: body };
+        }
+      default:
+        return { text: body };
+    }
+  }
+
+  // ========================================
+  // ROOMS LOADING
+  // ========================================
+
+  async loadRooms(): Promise<void> {
+    const userId = useAuthStore.getState().userId;
+    if (!userId) return;
+
+    const rooms = await roomRepository.findAllWithMetadata(userId);
+
+    const enrichedRooms = await Promise.all(
+      rooms.map(async (room) => {
+        const lastMessages = await messageRepository.findByRoom(room.id, { limit: 1 });
+        const lastMsg = lastMessages[0];
+        return {
+          ...room,
+          lastMessageText: lastMsg?.body || undefined,
+          lastMessageType: lastMsg?.type || undefined,
+          hasSession: room.hasSession ? true : false,
+        };
+      })
+    );
+
+    useChatStore.getState().setAllRooms(enrichedRooms);
+  }
+
+  async loadRoomMessages(roomId: number): Promise<void> {
+    const messages = await messageRepository.findByRoom(roomId, { limit: PAGE_SIZE });
+    const sorted = messages.reverse();
+
+    useChatStore.getState().setMessages(roomId, sorted);
+
+    useChatStore.getState().setPaginationState(roomId, {
+      hasMore: messages.length >= PAGE_SIZE,
+      oldestTimestamp: sorted.length > 0 ? sorted[0].timestamp : null,
+      isLoadingMore: false,
+    });
+  }
+
+  async loadMoreMessages(roomId: number, beforeTimestamp: number): Promise<void> {
+    const messages = await messageRepository.findByRoom(roomId, {
+      limit: PAGE_SIZE,
+      beforeTimestamp,
+    });
+
+    const store = useChatStore.getState();
+
+    if (messages.length === 0) {
+      store.setPaginationState(roomId, { hasMore: false, isLoadingMore: false });
+      return;
+    }
+
+    const sorted = messages.reverse();
+    store.prependMessages(roomId, sorted);
+
+    store.setPaginationState(roomId, {
+      hasMore: messages.length >= PAGE_SIZE,
+      oldestTimestamp: sorted[0].timestamp,
+      isLoadingMore: false,
+    });
+  }
+
+  async loadRoomProfiles(roomId: number): Promise<void> {
+    const profiles = await profileRepository.findByRoom(roomId);
+    useChatStore.getState().setProfiles(roomId, profiles);
+  }
+
+  async loadAllRoomProfiles(): Promise<void> {
+    const rooms = useChatStore.getState().allRooms;
+    for (const room of rooms) {
+      const profiles = await profileRepository.findByRoom(room.id);
+      useChatStore.getState().setProfiles(room.id, profiles);
+    }
+  }
+
+  // ========================================
+  // HELPERS
+  // ========================================
+
+  private extractUserBody(type: UserMessageTypeValue, payload: any): string {
+    switch (type) {
+      case UserMessageType.TEXT:
+        return payload?.text || '';
+      case UserMessageType.IMAGE:
+      case UserMessageType.PERSISTENT_IMAGE:
+      case UserMessageType.EPHEMERAL_IMAGE:
+      case UserMessageType.FILE:
+        return JSON.stringify(payload || {});
+      case UserMessageType.AUDIO:
+      case UserMessageType.VIDEO:
+      case UserMessageType.LOCATION:
+        return payload?.base64 || payload?.url || JSON.stringify(payload || {});
+      default:
+        return payload?.text || JSON.stringify(payload || {});
+    }
+  }
+
+  private async refreshRoomLastMessage(roomId: number): Promise<void> {
+    const lastMessages = await messageRepository.findByRoom(roomId, { limit: 1 });
+    const lastMsg = lastMessages[0];
+    useChatStore.getState().updateRoomInList(roomId, {
+      lastMessageText: lastMsg?.body || undefined,
+      lastMessageType: lastMsg?.type || undefined,
+      lastMessageTime: lastMsg?.timestamp || null,
+    });
+  }
+
+  /**
+   * Full local cleanup for a deleted room. Each step is independent
+   * so a failure in one doesn't block the others.
+   */
+  private async handleUserLeftRoom(roomId: number, userId: number): Promise<void> {
+    const ownUserId = useAuthStore.getState().userId;
+
+    if (userId === ownUserId) {
+      // Current user left the room — full cleanup
+      await this.performLocalRoomCleanup(roomId);
+      return;
+    }
+
+    // Another user left — remove their messages and profile
+    try {
+      await messageRepository.deleteByUserInRoom(roomId, userId);
+    } catch (e) {
+      logger.warn('[ChatService] handleUserLeftRoom: deleteByUserInRoom failed:', e);
+    }
+
+    try {
+      await profileRepository.deleteByUserAndRoom(userId, roomId);
+    } catch (e) {
+      logger.warn('[ChatService] handleUserLeftRoom: deleteByUserAndRoom failed:', e);
+    }
+
+    useChatStore.getState().removeProfile(roomId, userId);
+
+    // Reload messages in memory to reflect removal
+    await this.loadRoomMessages(roomId);
+  }
+
+  private async performLocalRoomCleanup(roomId: number): Promise<void> {
+    logger.info('[ChatService] performLocalRoomCleanup:', roomId);
+
+    try { await this.deleteRoomImages(roomId); }
+    catch (e) { logger.warn('[ChatService] cleanup deleteRoomImages failed:', e); }
+
+    try { queueService.removeMessagesByRoom(roomId); }
+    catch (e) { logger.warn('[ChatService] cleanup removeMessagesByRoom failed:', e); }
+
+    try { await roomRepository.hardDelete(roomId); }
+    catch (e) { logger.warn('[ChatService] cleanup hardDelete failed:', e); }
+
+    try { await sessionService.deleteSessionsByRoom(roomId); }
+    catch (e) { logger.warn('[ChatService] cleanup deleteSessionsByRoom failed:', e); }
+
+    try { await senderKeyRepository.deleteSessionsByRoom(roomId); }
+    catch (e) { logger.warn('[ChatService] cleanup deleteSessionsByRoom (senderKey) failed:', e); }
+
+    try { await senderKeyRepository.clearRetryQueueByRoom(roomId); }
+    catch (e) { logger.warn('[ChatService] cleanup clearRetryQueueByRoom failed:', e); }
+
+    useChatStore.getState().removeRoomFromList(roomId);
+    useChatStore.getState().clearRoom(roomId);
+  }
+
+  private async deleteRoomImages(roomId: number): Promise<void> {
+    try {
+      const imageMessages = await messageRepository.findByRoomAndType(roomId, UserMessageType.IMAGE);
+      const persistentImageMessages = await messageRepository.findByRoomAndType(roomId, UserMessageType.PERSISTENT_IMAGE);
+      const allImageMessages = [...imageMessages, ...persistentImageMessages];
+      if (allImageMessages.length > 0) {
+        deleteImagesByMessageIds(allImageMessages.map((m) => m.id));
+        logger.info('[ChatService] Deleted', allImageMessages.length, 'image files for room', roomId);
+      }
+    } catch (error) {
+      logger.warn('[ChatService] deleteRoomImages error:', error);
+    }
+
+    try {
+      const fileMessages = await messageRepository.findByRoomAndType(roomId, UserMessageType.FILE);
+      if (fileMessages.length > 0) {
+        deleteFilesByMessageIds(fileMessages.map((m) => m.id));
+        logger.info('[ChatService] Deleted', fileMessages.length, 'cached files for room', roomId);
+      }
+    } catch (error) {
+      logger.warn('[ChatService] deleteRoomFiles error:', error);
+    }
+  }
+
+  private async downloadAndDecryptPersistentImage(
+    messageId: string,
+    roomId: number,
+    payload: PersistentImagePayload
+  ): Promise<void> {
+    try {
+      logger.info('[ChatService] Persistent image download starting:', messageId, payload.mediaId);
+
+      const api = serverRegistry.getApiForRoom(roomId);
+      const encryptedArrayBuffer = await api.downloadMedia(payload.mediaId);
+      logger.info('[ChatService] Persistent image downloaded, size:', encryptedArrayBuffer.byteLength);
+
+      // Convert ArrayBuffer to base64 for the native decrypt function
+      const bytes = new Uint8Array(encryptedArrayBuffer);
+      let binary = '';
+      for (let i = 0; i < bytes.byteLength; i++) {
+        binary += String.fromCharCode(bytes[i]);
+      }
+      const encryptedBase64 = btoa(binary);
+
+      // Decrypt using native platform crypto (returns base64)
+      const base64Image = await mediaCryptoService.decrypt(encryptedBase64, payload.mediaKey, payload.iv);
+      logger.info('[ChatService] Persistent image decrypted, base64 length:', base64Image.length);
+
+      // Save to filesystem
+      const filePath = await saveImageToFile(base64Image, messageId, payload.mimeType);
+      logger.info('[ChatService] Persistent image saved to:', filePath);
+
+      // Update body with filePath (same format as volatile images after persist)
+      const updatedBody = JSON.stringify({
+        filePath,
+        thumbnail: payload.thumbnail || '',
+        width: payload.width,
+        height: payload.height,
+        mimeType: payload.mimeType,
+      });
+
+      await messageRepository.updateBody(messageId, updatedBody);
+      useChatStore.getState().updateMessage(roomId, messageId, { body: updatedBody });
+
+      logger.info('[ChatService] Persistent image body updated in store:', messageId);
+    } catch (error: any) {
+      logger.error('[ChatService] Persistent image download/decrypt FAILED:', messageId, error?.message || error);
+      if (error?.response?.status === 404 || error?.message?.includes('expired')) {
+        logger.warn('[ChatService] Persistent image expired or not found:', payload.mediaId);
+      } else {
+        throw error;
+      }
+    }
+  }
+
+  private async persistImageToFilesystem(
+    messageId: string,
+    roomId: number,
+    payload: ImageMessagePayload
+  ): Promise<void> {
+    if (!payload.base64) return;
+
+    try {
+      const filePath = await saveImageToFile(payload.base64, messageId, payload.mimeType);
+
+      const lightBody = JSON.stringify({
+        filePath,
+        thumbnail: payload.thumbnail || '',
+        width: payload.width,
+        height: payload.height,
+        mimeType: payload.mimeType,
+      });
+
+      await messageRepository.updateBody(messageId, lightBody);
+      useChatStore.getState().updateMessage(roomId, messageId, { body: lightBody });
+
+      logger.info('[ChatService] Image persisted to filesystem:', filePath);
+    } catch (error) {
+      logger.warn('[ChatService] persistImageToFilesystem error:', error);
+    }
+  }
+
+  private updateRoomAfterMessage(roomId: number, body: string, type?: string): void {
+    const store = useChatStore.getState();
+    store.updateRoomInList(roomId, {
+      lastMessageTime: Date.now(),
+      lastMessageText: body,
+      lastMessageType: type,
+    });
+  }
+}
+
+export const chatService = new ChatService();
+export default chatService;

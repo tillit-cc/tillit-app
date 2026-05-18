@@ -1,0 +1,9 @@
+{
+  "ios": {
+    "NSCameraUsageDescription": "TilliT needs access to your camera to take photos to send in messages.",
+    "NSPhotoLibraryUsageDescription": "TilliT needs access to your photo library to select photos to send in messages.",
+    "NSPhotoLibraryAddUsageDescription": "TilliT needs access to your photo library to save received images.",
+    "NSFaceIDUsageDescription": "TilliT uses Face ID to protect access to your encrypted messages.",
+    "NSMicrophoneUsageDescription": "TilliT needs access to your microphone to record voice messages."
+  }
+}

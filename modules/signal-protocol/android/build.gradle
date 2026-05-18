@@ -1,0 +1,27 @@
+plugins {
+  id 'com.android.library'
+  id 'expo-module-gradle-plugin'
+}
+
+group = 'host.exp.exponent'
+version = '1.0.0'
+
+android {
+  namespace "expo.modules.signalprotocol"
+  defaultConfig {
+    versionCode 1
+    versionName "1.0.0"
+  }
+  compileOptions {
+    coreLibraryDesugaringEnabled true
+  }
+}
+
+dependencies {
+  implementation "org.signal:libsignal-client:0.86.5"
+  implementation "org.signal:libsignal-android:0.86.5"
+  implementation "androidx.security:security-crypto:1.1.0-alpha06"
+  implementation "androidx.biometric:biometric:1.1.0"
+  implementation "androidx.core:core-ktx:1.15.0"
+  coreLibraryDesugaring 'com.android.tools:desugar_jdk_libs:2.0.3'
+}

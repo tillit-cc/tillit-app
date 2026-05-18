@@ -1,0 +1,115 @@
+import { create } from 'zustand';
+import { immer } from 'zustand/middleware/immer';
+import { enableMapSet } from 'immer';
+import { SocketConnectionState } from '@/types/connection';
+import { Server } from '@/db/schema';
+
+// Ensure MapSet plugin is enabled (may already be from chat.store)
+enableMapSet();
+
+interface ServerState {
+  servers: Server[];
+  connectionStates: Map<number, SocketConnectionState>;
+  reconnectAttempts: Map<number, number>;
+  bannedServers: Set<number>;
+
+  // Actions
+  setServers: (servers: Server[]) => void;
+  addServer: (server: Server) => void;
+  removeServer: (serverId: number) => void;
+  updateServer: (serverId: number, updates: Partial<Server>) => void;
+  setConnectionState: (serverId: number, state: SocketConnectionState) => void;
+  setReconnectAttempts: (serverId: number, attempts: number) => void;
+  setBanned: (serverId: number, banned: boolean) => void;
+
+  // Selectors
+  isAnyConnected: () => boolean;
+  isAnyConnecting: () => boolean;
+  getConnectionState: (serverId: number) => SocketConnectionState;
+  getReconnectAttempts: (serverId: number) => number;
+  isBanned: (serverId: number) => boolean;
+}
+
+export const useServerStore = create<ServerState>()(
+  immer((set, get) => ({
+    servers: [],
+    connectionStates: new Map(),
+    reconnectAttempts: new Map(),
+    bannedServers: new Set(),
+
+    setServers: (servers) =>
+      set((state) => {
+        state.servers = servers;
+      }),
+
+    addServer: (server) =>
+      set((state) => {
+        state.servers.push(server);
+      }),
+
+    removeServer: (serverId) =>
+      set((state) => {
+        state.servers = state.servers.filter((s) => s.id !== serverId);
+        state.connectionStates.delete(serverId);
+        state.reconnectAttempts.delete(serverId);
+      }),
+
+    updateServer: (serverId, updates) =>
+      set((state) => {
+        const index = state.servers.findIndex((s) => s.id === serverId);
+        if (index !== -1) {
+          state.servers[index] = { ...state.servers[index], ...updates };
+        }
+      }),
+
+    setConnectionState: (serverId, connectionState) =>
+      set((state) => {
+        state.connectionStates.set(serverId, connectionState);
+        if (connectionState === SocketConnectionState.CONNECTED) {
+          state.reconnectAttempts.set(serverId, 0);
+        }
+      }),
+
+    setReconnectAttempts: (serverId, attempts) =>
+      set((state) => {
+        state.reconnectAttempts.set(serverId, attempts);
+      }),
+
+    setBanned: (serverId, banned) =>
+      set((state) => {
+        if (banned) {
+          state.bannedServers.add(serverId);
+        } else {
+          state.bannedServers.delete(serverId);
+        }
+      }),
+
+    isAnyConnected: () => {
+      const states = get().connectionStates;
+      for (const state of states.values()) {
+        if (state === SocketConnectionState.CONNECTED) return true;
+      }
+      return false;
+    },
+
+    isAnyConnecting: () => {
+      const states = get().connectionStates;
+      for (const state of states.values()) {
+        if (state === SocketConnectionState.CONNECTING) return true;
+      }
+      return false;
+    },
+
+    getConnectionState: (serverId) => {
+      return get().connectionStates.get(serverId) ?? SocketConnectionState.CLOSED;
+    },
+
+    getReconnectAttempts: (serverId) => {
+      return get().reconnectAttempts.get(serverId) ?? 0;
+    },
+
+    isBanned: (serverId) => {
+      return get().bannedServers.has(serverId);
+    },
+  }))
+);

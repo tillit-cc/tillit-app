@@ -1,0 +1,9 @@
+{
+  "platforms": ["ios", "android"],
+  "ios": {
+    "modules": ["SecureViewModule"]
+  },
+  "android": {
+    "modules": ["expo.modules.secureview.SecureViewModule"]
+  }
+}

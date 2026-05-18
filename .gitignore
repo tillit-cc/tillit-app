@@ -1,0 +1,65 @@
+# Learn more https://docs.github.com/en/get-started/getting-started-with-git/ignoring-files
+
+# dependencies
+node_modules/
+
+# Expo
+.expo/
+dist/
+web-build/
+expo-env.d.ts
+
+# Native
+.kotlin/
+*.orig.*
+*.jks
+*.p8
+*.p12
+*.key
+*.mobileprovision
+
+# Metro
+.metro-health-check*
+
+# debug
+npm-debug.*
+yarn-debug.*
+yarn-error.*
+
+# macOS
+.DS_Store
+*.pem
+
+# local env files
+.env*.local
+.env.development
+
+# typescript
+*.tsbuildinfo
+
+# test coverage
+coverage/
+
+app-example
+
+# generated native folders
+/ios
+/android
+
+.idea
+
+# Custom Expo modules build artifacts
+modules/*/android/build/
+modules/*/ios/build/
+
+# Arti xcframework (250MB, downloaded from GitHub Release via scripts/download-arti.sh)
+modules/tor-proxy/ios/arti.xcframework/
+modules/tor-proxy/ios/arti.xcframework.zip
+
+.claude
+MEMORY.md
+memory/
+
+# Internal notes
+TODO.md
+/SECURITY-AUDIT-TODO.md

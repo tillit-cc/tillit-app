@@ -1,0 +1,9 @@
+{
+  "platforms": ["ios", "android"],
+  "ios": {
+    "modules": ["SignalProtocolModule"]
+  },
+  "android": {
+    "modules": ["expo.modules.signalprotocol.SignalProtocolModule"]
+  }
+}
