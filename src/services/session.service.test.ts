@@ -72,7 +72,7 @@ jest.mock('@/utils/server-id', () => ({
 // Import service AFTER mocks are set up
 // ============================================================================
 
-import { sessionService } from './session.service';
+import { sessionService, IdentityKeyMismatchError } from './session.service';
 import { serverRegistry } from './server-registry';
 
 // ============================================================================
@@ -395,6 +395,125 @@ describe('SessionService', () => {
       expect.objectContaining({ remoteUserId: '99' })
     );
     expect(SignalProtocol.establishSession).toHaveBeenCalledWith('99');
+  });
+
+  // ==========================================================================
+  // 17b. recoverSession: aborts on identity key mismatch (B-03)
+  // ==========================================================================
+  it('recoverSession aborts and surfaces alert on identity key mismatch', async () => {
+    (SignalProtocol.checkIdentityKeyChanged as jest.Mock).mockResolvedValueOnce({
+      changed: true,
+      reason: '',
+    });
+
+    await expect(sessionService.recoverSession(10, '99', 'alice')).rejects.toBeInstanceOf(
+      IdentityKeyMismatchError
+    );
+
+    // Fetched keys to compare identity but MUST NOT have applied them.
+    expect(mockApi.getRemoteKeys).toHaveBeenCalledWith('99');
+    expect(SignalProtocol.checkIdentityKeyChanged).toHaveBeenCalledWith('99', 'idKey==');
+    expect(SignalProtocol.setRemoteUserKeys).not.toHaveBeenCalled();
+    expect(SignalProtocol.establishSession).not.toHaveBeenCalled();
+    expect(mockAppState.addSecurityAlert).toHaveBeenCalledWith(
+      expect.objectContaining({ roomId: 10, userId: 99, type: 'identity_key_changed' })
+    );
+  });
+
+  // ==========================================================================
+  // 17c. recoverSession: proceeds on TOFU when first contact (no prior session)
+  // ==========================================================================
+  it('recoverSession proceeds on TOFU when no prior session row exists', async () => {
+    mockSessionRepo.findByUserAndRoom.mockResolvedValue(null);
+    (SignalProtocol.checkIdentityKeyChanged as jest.Mock).mockResolvedValueOnce({
+      changed: false,
+      reason: 'No identity saved yet',
+    });
+
+    await expect(sessionService.recoverSession(10, '99', 'alice')).resolves.toBeUndefined();
+
+    expect(SignalProtocol.setRemoteUserKeys).toHaveBeenCalledWith(
+      expect.objectContaining({ remoteUserId: '99', identityPublicKey: 'idKey==' })
+    );
+    expect(SignalProtocol.establishSession).toHaveBeenCalledWith('99');
+    expect(mockAppState.addSecurityAlert).not.toHaveBeenCalled();
+  });
+
+  // ==========================================================================
+  // 17d. recoverSession: tolerates native "Session not initialized" only on
+  //      first contact (no prior session row in DB)
+  // ==========================================================================
+  it('recoverSession proceeds when native check is unavailable AND no prior session', async () => {
+    mockSessionRepo.findByUserAndRoom.mockResolvedValue(null);
+    (SignalProtocol.checkIdentityKeyChanged as jest.Mock).mockRejectedValueOnce(
+      new Error('Session for remoteUserId 99 is not initialized.')
+    );
+
+    await expect(sessionService.recoverSession(10, '99', 'alice')).resolves.toBeUndefined();
+
+    expect(SignalProtocol.setRemoteUserKeys).toHaveBeenCalled();
+    expect(SignalProtocol.establishSession).toHaveBeenCalledWith('99');
+    expect(mockAppState.addSecurityAlert).not.toHaveBeenCalled();
+  });
+
+  // ==========================================================================
+  // 17f. recoverSession: aborts when prior session row exists but native store
+  //      has no identity (post-trust identity disappearance — suspected MITM)
+  // ==========================================================================
+  it('recoverSession aborts when prior session exists but native reports no identity', async () => {
+    mockSessionRepo.findByUserAndRoom.mockResolvedValue(makeSession({ idUser: '99', idRoom: 10 }));
+    (SignalProtocol.checkIdentityKeyChanged as jest.Mock).mockResolvedValueOnce({
+      changed: false,
+      reason: 'No identity saved yet',
+    });
+
+    await expect(sessionService.recoverSession(10, '99', 'alice')).rejects.toBeInstanceOf(
+      IdentityKeyMismatchError
+    );
+
+    expect(SignalProtocol.setRemoteUserKeys).not.toHaveBeenCalled();
+    expect(SignalProtocol.establishSession).not.toHaveBeenCalled();
+    expect(mockAppState.addSecurityAlert).toHaveBeenCalledWith(
+      expect.objectContaining({ roomId: 10, userId: 99, type: 'identity_key_changed' })
+    );
+  });
+
+  // ==========================================================================
+  // 17g. recoverSession: aborts when prior session exists but native check throws
+  // ==========================================================================
+  it('recoverSession aborts when prior session exists but native check throws', async () => {
+    mockSessionRepo.findByUserAndRoom.mockResolvedValue(makeSession({ idUser: '99', idRoom: 10 }));
+    (SignalProtocol.checkIdentityKeyChanged as jest.Mock).mockRejectedValueOnce(
+      new Error('Session for remoteUserId 99 is not initialized.')
+    );
+
+    await expect(sessionService.recoverSession(10, '99', 'alice')).rejects.toBeInstanceOf(
+      IdentityKeyMismatchError
+    );
+
+    expect(SignalProtocol.setRemoteUserKeys).not.toHaveBeenCalled();
+    expect(mockAppState.addSecurityAlert).toHaveBeenCalled();
+  });
+
+  // ==========================================================================
+  // 17e. setSession: re-throws IdentityKeyMismatchError instead of re-creating
+  // ==========================================================================
+  it('setSession does not recreate the session when resume surfaces identity mismatch', async () => {
+    const session = makeSession({ idUser: '99', idRoom: 10 });
+    mockSessionRepo.findByUserAndRoom.mockResolvedValue(session);
+    (SignalProtocol.resumeSession as jest.Mock).mockRejectedValueOnce(new Error('resume failed'));
+    (SignalProtocol.checkIdentityKeyChanged as jest.Mock).mockResolvedValueOnce({
+      changed: true,
+      reason: '',
+    });
+
+    await expect(sessionService.setSession(10, 99, 'alice')).rejects.toBeInstanceOf(
+      IdentityKeyMismatchError
+    );
+
+    // No fresh session was applied — old session preserved.
+    expect(SignalProtocol.setRemoteUserKeys).not.toHaveBeenCalled();
+    expect(mockSessionRepo.upsert).not.toHaveBeenCalled();
   });
 
   // ==========================================================================

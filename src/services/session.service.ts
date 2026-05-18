@@ -15,6 +15,19 @@ const PREKEY_BATCH_SIZE = 50;
 const SIGNED_PREKEY_ROTATE_DAYS = 30;
 const LAST_SIGNED_PREKEY_ROTATION_KEY = 'last_signed_prekey_rotation';
 
+/**
+ * Thrown when the server returns a remote user's identity key that doesn't match
+ * the one already stored locally. Signals a potential MITM during session recovery.
+ * Callers MUST NOT proceed with applying the new keys — the existing session is
+ * preserved and a security alert is surfaced to the user via the app store.
+ */
+export class IdentityKeyMismatchError extends Error {
+  constructor(public readonly remoteUserId: string) {
+    super(`Identity key mismatch for remote user ${remoteUserId}`);
+    this.name = 'IdentityKeyMismatchError';
+  }
+}
+
 class SessionService {
   sessions: Map<number, Session[]> = new Map();
 
@@ -66,6 +79,11 @@ class SessionService {
         await this.resumeSession(roomId, remoteUserIdStr, username, deviceId);
         return true;
       } catch (error) {
+        if (error instanceof IdentityKeyMismatchError) {
+          // MITM suspected during recovery — do NOT recreate the session,
+          // which would silently accept the new identity key.
+          throw error;
+        }
         logger.info('[SessionService] Resume failed, recreating session:', error);
       }
     }
@@ -273,16 +291,76 @@ class SessionService {
     return sessionsList;
   }
 
-  async recoverSession(roomId: number, remoteUserId: string, remoteUserName: string): Promise<void> {
+  async recoverSession(roomId: number, remoteUserId: string, _remoteUserName: string): Promise<void> {
     logger.info('[SessionService] Attempting recovery for', remoteUserId);
 
+    let remoteKeys: any;
     try {
-      await this.reloadRemoteKeys(roomId, remoteUserId);
+      remoteKeys = await this.fetchRemoteKeys(roomId, remoteUserId);
+    } catch (error) {
+      logger.error('[SessionService] Recovery fetch failed:', error);
+      throw new Error(`Failed to recover session for user ${remoteUserId}: ${error}`);
+    }
+
+    // Compare the freshly fetched identity key with the one already trusted.
+    // A mismatch means the server (or someone tampering with it) is trying to
+    // substitute the remote user's identity while we're rebuilding the session.
+    await this.assertIdentityNotChanged(roomId, remoteUserId, String(remoteKeys.identityPublicKey || ''));
+
+    try {
+      await this.applyRemoteKeys(remoteUserId, remoteKeys);
       await SignalProtocol.establishSession(String(remoteUserId));
       logger.info('[SessionService] Session recovered for', remoteUserId);
     } catch (error) {
       logger.error('[SessionService] Recovery failed:', error);
       throw new Error(`Failed to recover session for user ${remoteUserId}: ${error}`);
+    }
+  }
+
+  private async assertIdentityNotChanged(
+    roomId: number,
+    remoteUserId: string,
+    newIdentityKey: string
+  ): Promise<void> {
+    // A row in sessionRepository means we previously established trust with this
+    // user's identity. If it's there, "No identity saved yet" or a native error
+    // is NOT a valid TOFU situation — silently accepting a new identity would
+    // bypass the gating. TOFU is allowed only on genuine first contact (no row).
+    const priorSession = await sessionRepository.findByUserAndRoom(remoteUserId, roomId);
+
+    let result: { changed: boolean; reason?: string } | undefined;
+    let nativeError: unknown;
+    try {
+      result = await SignalProtocol.checkIdentityKeyChanged(remoteUserId, newIdentityKey);
+    } catch (error) {
+      nativeError = error;
+    }
+
+    if (result?.changed) {
+      this.handleIdentityKeyChanged(roomId, Number(remoteUserId));
+      throw new IdentityKeyMismatchError(remoteUserId);
+    }
+
+    const nativeHasNoIdentity =
+      nativeError !== undefined ||
+      (typeof result?.reason === 'string' && /No identity saved/i.test(result.reason));
+
+    if (nativeHasNoIdentity && priorSession) {
+      logger.error(
+        '[SessionService] Identity gating: prior session exists for',
+        remoteUserId,
+        'but native store has no trusted identity — refusing to TOFU on recovery',
+        nativeError ? `(native error: ${(nativeError as any)?.message ?? nativeError})` : '(reason: No identity saved yet)'
+      );
+      this.handleIdentityKeyChanged(roomId, Number(remoteUserId));
+      throw new IdentityKeyMismatchError(remoteUserId);
+    }
+
+    if (nativeHasNoIdentity) {
+      logger.info(
+        '[SessionService] Identity check: no prior trust, allowing TOFU for',
+        remoteUserId
+      );
     }
   }
 
@@ -301,7 +379,8 @@ class SessionService {
 
     if (reason && reason.includes('No identity saved')) {
       try {
-        await this.reloadRemoteKeys(roomId, remoteUserId);
+        const keys = await this.fetchRemoteKeys(roomId, remoteUserId);
+        await this.applyRemoteKeys(remoteUserId, keys);
         const result = await SignalProtocol.checkIdentityKeyChanged(remoteUserId);
         return result.changed;
       } catch (error) {
@@ -471,11 +550,25 @@ class SessionService {
     }
   }
 
-  private async reloadRemoteKeys(roomId: number, remoteUserId: string): Promise<void> {
+  /**
+   * Pure fetch: returns the raw remote keys response without touching the
+   * native crypto store. Split from {@link applyRemoteKeys} so that callers
+   * can inspect/validate the response (e.g. identity key comparison) before
+   * committing the new keys to the protocol store.
+   */
+  private async fetchRemoteKeys(roomId: number, remoteUserId: string): Promise<any> {
     const api = this.getApiForRoom(roomId);
     const remoteKeys = await api.getRemoteKeys(remoteUserId);
     if (!remoteKeys) throw new Error('Remote keys not found');
+    return remoteKeys;
+  }
 
+  /**
+   * Commit fetched remote keys to the native protocol store. Caller is
+   * responsible for any validation (e.g. identity key trust check) prior
+   * to invoking this — once called, the local identity store is updated.
+   */
+  private async applyRemoteKeys(remoteUserId: string, remoteKeys: any): Promise<void> {
     const preKey = remoteKeys.preKey || null;
     const kyberPreKey = remoteKeys.kyberPreKey || null;
     const signedPreKey = remoteKeys.signedPreKey || null;
