@@ -2,7 +2,7 @@
   "expo": {
     "name": "TilliT",
     "slug": "tillit",
-    "version": "1.4.0",
+    "version": "1.4.1",
     "orientation": "portrait",
     "icon": "./assets/images/icon.png",
     "scheme": "tillitnative",
@@ -14,7 +14,7 @@
     },
     "ios": {
       "supportsTablet": false,
-      "buildNumber": "46",
+      "buildNumber": "47",
       "bundleIdentifier": "com.oglut.tillit.native",
       "appleTeamId": "663AVHG5AG",
       "associatedDomains": ["applinks:tillit.cc"],
