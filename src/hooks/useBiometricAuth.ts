@@ -55,8 +55,12 @@ export function useBiometricAuth() {
   };
 
   const handleAppStateChange = async (nextAppState: AppStateStatus) => {
-    if (nextAppState === 'background' || nextAppState === 'inactive') {
-      // Lock when app goes to background
+    // Only react to a true backgrounding — iOS fires 'inactive' for transient
+    // events (the Face ID / Touch ID prompt itself, control center, incoming
+    // calls). Locking on 'inactive' invalidates the LAContext mid-prompt, so
+    // the post-auth `loadStoredLocalUser` would either fail or trigger a
+    // second biometric prompt.
+    if (nextAppState === 'background') {
       await SignalProtocol.lock();
       setState((prev) => ({ ...prev, isAuthenticated: false }));
     }

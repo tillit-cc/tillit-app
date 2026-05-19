@@ -48,10 +48,6 @@ class KeychainHelper {
     private var authenticationTimestamp: Date?
     private let authenticationTimeout: TimeInterval = 900
 
-    // In-memory tracker of items already migrated from legacy storage during this
-    // unlock session — prevents repeated re-saves on every read.
-    private var migratedThisSession = Set<String>()
-
     // Rate limiting for failed authentication attempts
     private static var failedAttempts = 0
     private static var lastFailedAttempt: Date?
@@ -76,7 +72,6 @@ class KeychainHelper {
                 authContext = nil
                 _isAuthenticated = false
                 authenticationTimestamp = nil
-                migratedThisSession.removeAll()
                 return nil
             }
             return authContext
@@ -149,6 +144,11 @@ class KeychainHelper {
         // kSecUseAuthenticationContext so the Keychain trusts our unlock without
         // re-prompting on every read.
         let context = LAContext()
+        // Touch ID-only: without this, each Keychain item with a userPresence
+        // ACL re-prompts even when `kSecUseAuthenticationContext` is provided
+        // (the default reuse duration is 0). Ignored on Face ID, which keeps
+        // the LAContext authenticated until invalidated.
+        context.touchIDAuthenticationAllowableReuseDuration = LATouchIDAuthenticationMaximumAllowableReuseDuration
         context.evaluatePolicy(.deviceOwnerAuthentication, localizedReason: reason) { [weak self] success, authError in
             guard let self = self else { return }
 
@@ -157,7 +157,6 @@ class KeychainHelper {
                 if success {
                     self.authContext = context
                     self.authenticationTimestamp = Date()
-                    self.migratedThisSession.removeAll()
                     // Reset rate limiting on success
                     KeychainHelper.failedAttempts = 0
                     KeychainHelper.lastFailedAttempt = nil
@@ -209,7 +208,6 @@ class KeychainHelper {
             authContext = nil
             _isAuthenticated = false
             authenticationTimestamp = nil
-            migratedThisSession.removeAll()
         }
     }
 
@@ -296,14 +294,15 @@ class KeychainHelper {
             return nil
         }
 
-        // Migration: legacy items have no ACL. Re-save with SecAccessControl
-        // on first read this session. Set.insert returns (inserted: Bool, ...)
-        // so check-and-mark is atomic against concurrent reads of the same key.
-        let needsMigration = queue.sync { migratedThisSession.insert(key).inserted }
-        if needsMigration {
-            _ = saveProtected(data: data, for: key)
-        }
-
+        // NOTE: items in `protectedService` are written exclusively by
+        // `saveProtected`, which always attaches a `userPresence` SecAccessControl.
+        // A read here means the item already carries the new ACL — re-saving on
+        // first read each session is redundant. Some iOS releases also surface a
+        // fresh biometric prompt on `SecItemAdd` for ACL items even with
+        // `kSecUseAuthenticationContext`, so the migration re-save was producing
+        // extra Face ID prompts at every cold start. True legacy migrations from
+        // the non-protected `service` namespace happen one-shot in
+        // `loadMetadata()` / `db/client.ts` via `load` + `saveProtected`.
         return data
     }
 
@@ -480,7 +479,6 @@ class KeychainHelper {
             authContext = nil
             _isAuthenticated = false
             authenticationTimestamp = nil
-            migratedThisSession.removeAll()
         }
     }
 }

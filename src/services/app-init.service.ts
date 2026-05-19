@@ -346,17 +346,14 @@ class AppInitService {
         logger.warn('[AppInit] Lock error:', error);
       }
     } else if (nextAppState === 'inactive') {
-      // Transient state (Face ID, system dialogs, notification center).
-      // Lock keychain but keep sockets alive.
+      // Transient state (Face ID prompt, system dialogs, notification center).
+      // Track the timestamp so the 'active' branch can decide whether to
+      // require re-auth, but DO NOT call `SignalProtocol.lock()` here: iOS
+      // raises 'inactive' the moment the biometric UI overlays the app, and
+      // invalidating the LAContext mid-prompt produces a second Face ID prompt
+      // (and races with the in-flight authenticate() completion).
       this.lastBackground = Date.now();
       appStore.setInBackground(true);
-
-      try {
-        await SignalProtocol.lock();
-        logger.info('[AppInit] Keychain locked (inactive)');
-      } catch (error) {
-        logger.warn('[AppInit] Lock error:', error);
-      }
     } else if (nextAppState === 'active') {
       // Coming to foreground
       appStore.setInBackground(false);
