@@ -73,9 +73,26 @@ export function useBiometricAuth() {
       const result = await SignalProtocol.authenticate(reason || 'Autenticazione richiesta');
 
       if (result.success) {
-        // Load stored identity after successful authentication
-        if (state.hasStoredIdentity) {
+        // Always load the stored identity after a successful unlock.
+        //
+        // We intentionally do NOT gate this on `hasStoredIdentity`: that flag
+        // comes from `existsProtected`, which cannot reliably probe an item
+        // behind a `userPresence` ACL without either prompting or relying on
+        // iOS-version-specific OSStatus codes. The `/locked` screen is only
+        // ever reached when `loadStoredToken()` found a persisted session
+        // (token or userId in SecureStore) — and a session implies an identity
+        // exists. So just load it. The only acceptable failure is a literal
+        // "no stored identity" (brand-new user who shouldn't be here anyway);
+        // anything else is a real error and must surface.
+        try {
           await SignalProtocol.loadStoredLocalUser();
+        } catch (loadErr: any) {
+          const msg = loadErr instanceof Error ? loadErr.message : String(loadErr);
+          if (msg.includes('No stored identity')) {
+            console.warn('[useBiometricAuth] No stored identity to load (new user?)');
+          } else {
+            throw loadErr;
+          }
         }
 
         setState((prev) => ({
@@ -103,7 +120,7 @@ export function useBiometricAuth() {
       }));
       return false;
     }
-  }, [state.hasStoredIdentity]);
+  }, []);
 
   const lock = useCallback(async () => {
     await SignalProtocol.lock();

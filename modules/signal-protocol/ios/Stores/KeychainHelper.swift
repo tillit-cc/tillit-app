@@ -139,17 +139,22 @@ class KeychainHelper {
             return
         }
 
-        // Authenticate with LAContext (biometric/passcode).
-        // The SAME context is then kept and passed to SecItemCopyMatching via
-        // kSecUseAuthenticationContext so the Keychain trusts our unlock without
-        // re-prompting on every read.
+        // Authenticate the LAContext directly against the SecAccessControl that
+        // protects our items. `evaluatePolicy(.deviceOwnerAuthentication)` is too
+        // generic — on iOS 17/18 the Keychain re-prompts on every SecItemCopyMatching
+        // call for items with `.userPresence` ACL even when `kSecUseAuthenticationContext`
+        // is provided, because the context wasn't authenticated *against that ACL*.
+        // `evaluateAccessControl(_, operation: .useItem, ...)` ties the unlock to the
+        // exact ACL, so subsequent Keychain reads/writes don't prompt again.
+        guard let accessControl = makeAccessControl() else {
+            DispatchQueue.main.async {
+                completion(false, KeychainError.authenticationFailed("ACL_CREATION_FAILED"))
+            }
+            return
+        }
+
         let context = LAContext()
-        // Touch ID-only: without this, each Keychain item with a userPresence
-        // ACL re-prompts even when `kSecUseAuthenticationContext` is provided
-        // (the default reuse duration is 0). Ignored on Face ID, which keeps
-        // the LAContext authenticated until invalidated.
-        context.touchIDAuthenticationAllowableReuseDuration = LATouchIDAuthenticationMaximumAllowableReuseDuration
-        context.evaluatePolicy(.deviceOwnerAuthentication, localizedReason: reason) { [weak self] success, authError in
+        context.evaluateAccessControl(accessControl, operation: .useItem, localizedReason: reason) { [weak self] success, authError in
             guard let self = self else { return }
 
             self.queue.sync {
@@ -274,6 +279,9 @@ class KeychainHelper {
     func loadProtected(for key: String) -> Data? {
         // Atomic check: returns the LAContext only if still unlocked.
         guard let context = authenticatedContext() else {
+            #if DEBUG
+            NSLog("[KeychainHelper] loadProtected(\(key)) failed: no authenticated context")
+            #endif
             return nil
         }
         touchAuthentication()
@@ -291,6 +299,9 @@ class KeychainHelper {
         let status = SecItemCopyMatching(query as CFDictionary, &dataTypeRef)
 
         guard status == errSecSuccess, let data = dataTypeRef as? Data else {
+            #if DEBUG
+            NSLog("[KeychainHelper] loadProtected(\(key)) failed: OSStatus=\(status)")
+            #endif
             return nil
         }
 
@@ -319,16 +330,37 @@ class KeychainHelper {
     }
 
     /// Check if a protected key exists - NO biometric prompt
+    ///
+    /// On iOS 17/18 a `SecItemCopyMatching` against an item with a `userPresence`
+    /// ACL triggers a Face ID / Touch ID prompt even when only attributes are
+    /// requested. `kSecUseAuthenticationUI = kSecUseAuthenticationUISkip` tells
+    /// the Keychain to fail rather than prompt.
+    ///
+    /// Robust existence test: the ONLY status that means "the item is not there"
+    /// is `errSecItemNotFound`. Every other status — `errSecSuccess` (readable
+    /// without auth), `errSecInteractionNotAllowed` (exists, locked behind
+    /// biometric), `errSecAuthFailed`, etc. — means the item DOES exist, we just
+    /// may not be able to read it without auth. The exact code for "exists but
+    /// locked" varies across iOS versions, so we cannot enumerate them; we only
+    /// special-case the unambiguous "not found".
     func existsProtected(for key: String) -> Bool {
         let query: [String: Any] = [
             kSecClass as String: kSecClassGenericPassword,
             kSecAttrService as String: protectedService,
             kSecAttrAccount as String: key,
-            kSecReturnAttributes as String: kCFBooleanTrue!
+            // Required: SecItemCopyMatching needs at least one kSecReturn* option
+            // or it errors with errSecParam.
+            kSecReturnAttributes as String: kCFBooleanTrue!,
+            // Suppress the biometric prompt — see doc comment above.
+            kSecUseAuthenticationUI as String: kSecUseAuthenticationUISkip
         ]
 
         let status = SecItemCopyMatching(query as CFDictionary, nil)
-        return status == errSecSuccess
+        let exists = status != errSecItemNotFound
+        #if DEBUG
+        NSLog("[KeychainHelper] existsProtected(\(key)) OSStatus=\(status) -> \(exists)")
+        #endif
+        return exists
     }
 
     // MARK: - Standard Keychain Operations (for other data)
