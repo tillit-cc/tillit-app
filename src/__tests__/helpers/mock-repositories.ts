@@ -45,6 +45,7 @@ export function createMockSessionRepository() {
     create: jest.fn().mockResolvedValue(undefined),
     findById: jest.fn().mockResolvedValue(null),
     findByUserAndRoom: jest.fn().mockResolvedValue(null),
+    findByUserRoomAndDevice: jest.fn().mockResolvedValue(null),
     findAll: jest.fn().mockResolvedValue([]),
     findByRoom: jest.fn().mockResolvedValue([]),
     upsert: jest.fn().mockResolvedValue(undefined),
@@ -54,6 +55,7 @@ export function createMockSessionRepository() {
     deleteByUserAndRoom: jest.fn().mockResolvedValue(undefined),
     deleteByRoom: jest.fn().mockResolvedValue(undefined),
     exists: jest.fn().mockResolvedValue(false),
+    updateRemoteKnownDevicesForUser: jest.fn().mockResolvedValue(undefined),
   };
 }
 

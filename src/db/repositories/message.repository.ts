@@ -1,4 +1,4 @@
-import { eq, and, desc, asc, lt, inArray, sql } from 'drizzle-orm';
+import { eq, and, desc, asc, lt, notInArray, inArray, isNull, sql } from 'drizzle-orm';
 import { getDatabase } from '../client';
 import { messages, Message, NewMessage, MessageStatus } from '../schema';
 
@@ -67,7 +67,9 @@ export const messageRepository = {
   },
 
   /**
-   * Mark message as read
+   * Mark message as read. Idempotent: skips rows that already have `read`
+   * set so re-applying the same MESSAGE_READ self-fanout doesn't keep
+   * pushing the timestamp forward (and doesn't burn writes on no-op).
    */
   async markAsRead(id: string): Promise<void> {
     const db = getDatabase();
@@ -75,7 +77,7 @@ export const messageRepository = {
     await db
       .update(messages)
       .set({ read: now, lastModified: sql`(strftime('%s', 'now'))` })
-      .where(eq(messages.id, id));
+      .where(and(eq(messages.id, id), isNull(messages.read)));
   },
 
   /**
@@ -133,6 +135,32 @@ export const messageRepository = {
       .select({ count: sql<number>`count(*)` })
       .from(messages)
       .where(and(eq(messages.idRoom, roomId), sql`${messages.read} IS NULL`));
+    return result[0]?.count ?? 0;
+  },
+
+  /**
+   * Count unread INCOMING messages for a room — excludes any sender in
+   * `excludeUserIds` (own userId + room serverUserId). Used after a
+   * MESSAGE_READ self-fanout applies `read` on incoming rows: the new
+   * unread counter for the room is whatever rows are still unread, minus
+   * the senders that count as "self" (self-fanout copies of our own
+   * outgoing message also live in the messages table but must not
+   * contribute to the unread badge).
+   */
+  async countUnreadIncoming(roomId: number, excludeUserIds: number[]): Promise<number> {
+    const db = getDatabase();
+    const filtered = excludeUserIds.filter((u) => Number.isFinite(u));
+    const where = filtered.length > 0
+      ? and(
+          eq(messages.idRoom, roomId),
+          isNull(messages.read),
+          notInArray(messages.idUserFrom, filtered),
+        )
+      : and(eq(messages.idRoom, roomId), isNull(messages.read));
+    const result = await db
+      .select({ count: sql<number>`count(*)` })
+      .from(messages)
+      .where(where);
     return result[0]?.count ?? 0;
   },
 

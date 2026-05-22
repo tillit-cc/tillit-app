@@ -13,11 +13,17 @@ export const sessionRepository = {
   },
 
   /**
-   * Upsert a session (insert or update)
+   * Upsert a session (insert or update). Keyed on the multi-device triple
+   * `(idUser, idRoom, remoteUserDeviceId)`: a peer with two linked devices
+   * has two distinct rows, one per device.
    */
   async upsert(session: NewSession): Promise<Session> {
     const db = getDatabase();
-    const existing = await this.findByUserAndRoom(session.idUser, session.idRoom);
+    const existing = await this.findByUserRoomAndDevice(
+      session.idUser,
+      session.idRoom,
+      session.remoteUserDeviceId,
+    );
 
     if (existing) {
       await db
@@ -40,7 +46,10 @@ export const sessionRepository = {
   },
 
   /**
-   * Get session by user ID and room ID
+   * Get any session for `(userId, roomId)`. Multi-device aware: if the
+   * peer has multiple linked devices, returns the most recently modified
+   * row. Callers that need a specific device should use
+   * {@link findByUserRoomAndDevice} instead.
    */
   async findByUserAndRoom(userId: string, roomId: number): Promise<Session | undefined> {
     const db = getDatabase();
@@ -48,6 +57,30 @@ export const sessionRepository = {
       .select()
       .from(sessions)
       .where(and(eq(sessions.idUser, userId), eq(sessions.idRoom, roomId)))
+      .orderBy(sql`${sessions.lastModified} DESC`)
+      .limit(1);
+    return result[0];
+  },
+
+  /**
+   * Get the session for an exact `(userId, roomId, deviceId)` triple. Used
+   * by the multi-device send/redistribute paths where we need to address
+   * one specific linked device rather than any device of that peer.
+   */
+  async findByUserRoomAndDevice(
+    userId: string,
+    roomId: number,
+    deviceId: number,
+  ): Promise<Session | undefined> {
+    const db = getDatabase();
+    const result = await db
+      .select()
+      .from(sessions)
+      .where(and(
+        eq(sessions.idUser, userId),
+        eq(sessions.idRoom, roomId),
+        eq(sessions.remoteUserDeviceId, deviceId),
+      ))
       .limit(1);
     return result[0];
   },
@@ -123,5 +156,28 @@ export const sessionRepository = {
   async exists(userId: string, roomId: number): Promise<boolean> {
     const session = await this.findByUserAndRoom(userId, roomId);
     return !!session;
+  },
+
+  /**
+   * Replace the persisted `remote_known_devices` CSV on every row for a
+   * user (across all rooms). The column is denormalized per-row but the
+   * value is a per-user property; we keep all rows in sync so any
+   * `findByUserAndRoom` lookup at boot returns the latest list.
+   *
+   * Pass an empty array to clear the cache (e.g. invalidate after
+   * `peerDeviceLinked` socket event).
+   */
+  async updateRemoteKnownDevicesForUser(userId: string, deviceIds: number[]): Promise<void> {
+    const db = getDatabase();
+    const csv = deviceIds.length === 0
+      ? null
+      : Array.from(new Set(deviceIds.map((n) => Number(n))))
+          .filter((n) => Number.isFinite(n) && n > 0)
+          .sort((a, b) => a - b)
+          .join(',');
+    await db
+      .update(sessions)
+      .set({ remoteKnownDevices: csv })
+      .where(eq(sessions.idUser, userId));
   },
 };
