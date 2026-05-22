@@ -17,10 +17,16 @@ import org.signal.libsignal.protocol.SignalProtocolAddress
 import org.signal.libsignal.protocol.groups.GroupCipher
 import org.signal.libsignal.protocol.groups.GroupSessionBuilder
 import org.signal.libsignal.protocol.message.SenderKeyDistributionMessage
+import org.signal.libsignal.protocol.ecc.ECPrivateKey
+import org.signal.libsignal.protocol.ecc.ECPublicKey
+import org.signal.libsignal.protocol.kdf.HKDF
 import org.signal.libsignal.protocol.state.KyberPreKeyRecord
 import org.signal.libsignal.protocol.state.PreKeyRecord
 import org.signal.libsignal.protocol.state.SignedPreKeyRecord
+import java.nio.ByteBuffer
+import java.security.MessageDigest
 import java.security.SecureRandom
+import java.util.Locale
 import java.util.UUID
 import javax.crypto.Cipher
 import javax.crypto.spec.GCMParameterSpec
@@ -28,8 +34,25 @@ import javax.crypto.spec.SecretKeySpec
 
 class SignalProtocolModule : Module() {
     private var localUser: LocalUser? = null
-    // M-10 FIX: ConcurrentHashMap for defensive thread safety
+    // M-10 FIX: ConcurrentHashMap for defensive thread safety.
+    //
+    // Multi-device (ADR-0001 D4): the map is keyed by `(userId, deviceId)`
+    // so we hold a distinct session per peer device. Encoding is
+    // `"<userId>/<deviceId>"`. Use `sessionKey()` to compose, and
+    // `getEncryptedSession()` / `putEncryptedSession()` / `removeEncryptedSession()`
+    // for type-safe access. The legacy `encryptedSessions[userId]` access
+    // pattern is gone — every call site must now know the deviceId
+    // (default 1 for backward-compat with single-device peers).
     private val encryptedSessions = java.util.concurrent.ConcurrentHashMap<String, EncryptedSession>()
+    private fun sessionKey(userId: String, deviceId: Int = 1): String = "$userId/$deviceId"
+    private fun getEncryptedSession(userId: String, deviceId: Int = 1): EncryptedSession? =
+        encryptedSessions[sessionKey(userId, deviceId)]
+    private fun putEncryptedSession(userId: String, deviceId: Int = 1, session: EncryptedSession) {
+        encryptedSessions[sessionKey(userId, deviceId)] = session
+    }
+    private fun removeEncryptedSession(userId: String, deviceId: Int) {
+        encryptedSessions.remove(sessionKey(userId, deviceId))
+    }
     private var senderKeyStore: PersistentSenderKeyStore? = null
 
     // H6/H7 FIX: Shared stores for pre-keys (all sessions share these)
@@ -42,6 +65,185 @@ class SignalProtocolModule : Module() {
     private val localUserMetadataStorageKey = "local-user-metadata"
 
     private val context get() = appContext.reactContext!!
+
+    // Shared identity-setup path used both by `initializeIdentity` (fresh
+    // install or explicit import) and by `consumeProvisioningPayload`
+    // (multi-device pairing — the linked device receives the primary's
+    // identity inside the decrypted payload and never exposes it to JS).
+    // When `importedIdentity` is null we generate a fresh identity; when
+    // non-null we adopt the provided keypair. All other keys (signed
+    // pre-key, pre-keys, kyber pre-keys, registrationId) are always
+    // generated fresh — per-device material, never shared across linked
+    // devices of the same user.
+    private fun performIdentitySetup(
+        deviceId: Int,
+        name: String,
+        importedIdentity: IdentityKeyPair?
+    ): Map<String, Any> {
+        val keystoreHelper = KeystoreHelper.getInstance(context)
+
+        val keys = KeyGeneration.generateKeys(existingIdentity = importedIdentity)
+        val identityKeyPairData = keys.identityKeyPair.serialize()
+
+        val preKeysArray = org.json.JSONArray()
+        keys.preKeys.forEach { preKeyRecord ->
+            val obj = org.json.JSONObject()
+            obj.put("id", preKeyRecord.id)
+            obj.put("publicKey", Base64.encodeToString(preKeyRecord.keyPair.publicKey.serialize(), Base64.NO_WRAP))
+            obj.put("key", Base64.encodeToString(preKeyRecord.serialize(), Base64.NO_WRAP))
+            preKeysArray.put(obj)
+        }
+
+        val kyberPreKeysArray = org.json.JSONArray()
+        keys.kyberPreKeys.forEach { kyberPreKey ->
+            val obj = org.json.JSONObject()
+            obj.put("id", kyberPreKey.id)
+            obj.put("publicKey", Base64.encodeToString(kyberPreKey.keyPair.publicKey.serialize(), Base64.NO_WRAP))
+            obj.put("signature", Base64.encodeToString(kyberPreKey.signature, Base64.NO_WRAP))
+            obj.put("key", Base64.encodeToString(kyberPreKey.serialize(), Base64.NO_WRAP))
+            kyberPreKeysArray.put(obj)
+        }
+
+        if (!keystoreHelper.saveProtected(identityKeyPairStorageKey, identityKeyPairData)) {
+            throw Exception("Failed to save identity key pair")
+        }
+
+        val metadata = org.json.JSONObject()
+        metadata.put("registrationId", keys.registrationId)
+        metadata.put("deviceId", deviceId)
+        metadata.put("name", name)
+        metadata.put("signedPreKeyRecord", Base64.encodeToString(keys.signedPreKeyRecord.serialize(), Base64.NO_WRAP))
+        metadata.put("preKeys", preKeysArray)
+        metadata.put("kyberPreKeys", kyberPreKeysArray)
+
+        if (!keystoreHelper.save(localUserMetadataStorageKey, metadata.toString().toByteArray(Charsets.UTF_8))) {
+            keystoreHelper.deleteProtected(identityKeyPairStorageKey)
+            throw Exception("Failed to save metadata")
+        }
+
+        val newLocalUser = LocalUser(
+            identityKey = keys.identityKeyPair,
+            registrationId = keys.registrationId.toUInt(),
+            preKeys = keys.preKeys,
+            signedPreKey = keys.signedPreKeyRecord,
+            kyberPreKeys = keys.kyberPreKeys,
+            deviceId = deviceId.toUInt(),
+            name = name
+        )
+        localUser = newLocalUser
+
+        newLocalUser.preKeys.forEach { preKey ->
+            sharedPreKeyStore?.storePreKey(preKey.id, preKey)
+        }
+        sharedSignedPreKeyStore?.storeSignedPreKey(newLocalUser.signedPreKey.id, newLocalUser.signedPreKey)
+        newLocalUser.kyberPreKeys.forEach { kyberPreKey ->
+            sharedKyberPreKeyStore?.storeKyberPreKey(kyberPreKey.id, kyberPreKey)
+        }
+
+        val publicPreKeys = keys.preKeys.map { preKeyRecord ->
+            mapOf(
+                "id" to preKeyRecord.id,
+                "publicKey" to Base64.encodeToString(preKeyRecord.keyPair.publicKey.serialize(), Base64.NO_WRAP)
+            )
+        }
+
+        val publicKyberPreKeys = keys.kyberPreKeys.map { kyberPreKey ->
+            mapOf(
+                "id" to kyberPreKey.id,
+                "publicKey" to Base64.encodeToString(kyberPreKey.keyPair.publicKey.serialize(), Base64.NO_WRAP),
+                "signature" to Base64.encodeToString(kyberPreKey.signature, Base64.NO_WRAP)
+            )
+        }
+
+        return mapOf(
+            "registrationId" to keys.registrationId,
+            "deviceId" to deviceId,
+            "identityPublicKey" to keys.identityKeyPublicBase64(),
+            "signedPreKey" to mapOf(
+                "id" to keys.signedPreKeyId().toInt(),
+                "publicKey" to keys.signedPreKeyPublicKeyBase64(),
+                "signature" to keys.signedPreKeyRecordSignatureBase64()
+            ),
+            "preKeys" to publicPreKeys,
+            "kyberPreKeys" to publicKyberPreKeys
+        )
+    }
+
+    // Shared ECDHE + HKDF + AES-256-GCM encrypt for the multi-device
+    // provisioning envelope. Returns the binary blob
+    // `[1B v=0x01][12B IV][N B ct][16B tag]`. Used by both the low-level
+    // `encryptProvisioning` AsyncFunction and the high-level
+    // `encryptProvisioningPayload` AsyncFunction.
+    // Normalize an X25519 public key to libsignal's DJB framed form
+    // (33 bytes, prefixed with 0x05). Non-libsignal clients (Web Crypto,
+    // libsodium, @stablelib — e.g. the desktop) emit the raw 32 bytes.
+    // Wrap them so `ECPublicKey(...)` doesn't throw `invalidKey` (error 11).
+    private fun normalizeDjbPublicKey(data: ByteArray): ByteArray {
+        if (data.size == 32) {
+            val out = ByteArray(33)
+            out[0] = 0x05
+            System.arraycopy(data, 0, out, 1, 32)
+            return out
+        }
+        return data
+    }
+
+    private fun encryptProvisioningEnvelope(
+        plaintext: ByteArray,
+        recipientPublicKey: String,
+        senderPrivateKey: String
+    ): ByteArray {
+        val recipientPubBytes = Base64.decode(recipientPublicKey, Base64.NO_WRAP)
+        val senderPrivBytes = Base64.decode(senderPrivateKey, Base64.NO_WRAP)
+        val recipientPub = ECPublicKey(normalizeDjbPublicKey(recipientPubBytes))
+        val senderPriv = ECPrivateKey(senderPrivBytes)
+        val sharedSecret = senderPriv.calculateAgreement(recipientPub)
+
+        val info = "tillit/provisioning/v1".toByteArray(Charsets.UTF_8)
+        val derivedKey = HKDF.deriveSecrets(sharedSecret, ByteArray(0), info, 32)
+
+        val nonce = ByteArray(12).also { SecureRandom().nextBytes(it) }
+        val cipher = Cipher.getInstance("AES/GCM/NoPadding")
+        cipher.init(Cipher.ENCRYPT_MODE, SecretKeySpec(derivedKey, "AES"), GCMParameterSpec(128, nonce))
+        cipher.updateAAD(info)
+        val ciphertextWithTag = cipher.doFinal(plaintext)
+
+        return ByteBuffer.allocate(1 + nonce.size + ciphertextWithTag.size)
+            .put(0x01.toByte())
+            .put(nonce)
+            .put(ciphertextWithTag)
+            .array()
+    }
+
+    private fun decryptProvisioningEnvelope(
+        ciphertextBase64: String,
+        recipientPrivateKey: String,
+        senderPublicKey: String
+    ): ByteArray {
+        val envelope = Base64.decode(ciphertextBase64, Base64.NO_WRAP)
+        if (envelope.size <= 1 + 12 + 16) {
+            throw Exception("Provisioning ciphertext too short")
+        }
+        if (envelope[0].toInt() != 0x01) {
+            throw Exception("Unsupported provisioning ciphertext version")
+        }
+        val nonce = envelope.copyOfRange(1, 13)
+        val ciphertextWithTag = envelope.copyOfRange(13, envelope.size)
+
+        val recipientPrivBytes = Base64.decode(recipientPrivateKey, Base64.NO_WRAP)
+        val senderPubBytes = Base64.decode(senderPublicKey, Base64.NO_WRAP)
+        val recipientPriv = ECPrivateKey(recipientPrivBytes)
+        val senderPub = ECPublicKey(normalizeDjbPublicKey(senderPubBytes))
+        val sharedSecret = recipientPriv.calculateAgreement(senderPub)
+
+        val info = "tillit/provisioning/v1".toByteArray(Charsets.UTF_8)
+        val derivedKey = HKDF.deriveSecrets(sharedSecret, ByteArray(0), info, 32)
+
+        val cipher = Cipher.getInstance("AES/GCM/NoPadding")
+        cipher.init(Cipher.DECRYPT_MODE, SecretKeySpec(derivedKey, "AES"), GCMParameterSpec(128, nonce))
+        cipher.updateAAD(info)
+        return cipher.doFinal(ciphertextWithTag)
+    }
 
     override fun definition() = ModuleDefinition {
         Name("SignalProtocol")
@@ -57,105 +259,30 @@ class SignalProtocolModule : Module() {
 
         // ========== IDENTITY INITIALIZATION ==========
 
-        AsyncFunction("initializeIdentity") { deviceId: Int, name: String ->
+        AsyncFunction("initializeIdentity") { deviceId: Int, name: String, existingIdentityKey: Map<String, String>? ->
             val keystoreHelper = KeystoreHelper.getInstance(context)
             if (!keystoreHelper.isAuthenticated) {
                 throw Exception("Must authenticate before creating identity")
             }
 
-            // 1. Generate all keys
-            val keys = KeyGeneration.generateKeys()
-
-            // 2. Extract data for storage
-            val identityKeyPairData = keys.identityKeyPair.serialize()
-
-            val preKeysArray = org.json.JSONArray()
-            keys.preKeys.forEach { preKeyRecord ->
-                val obj = org.json.JSONObject()
-                obj.put("id", preKeyRecord.id)
-                obj.put("publicKey", Base64.encodeToString(preKeyRecord.keyPair.publicKey.serialize(), Base64.NO_WRAP))
-                obj.put("key", Base64.encodeToString(preKeyRecord.serialize(), Base64.NO_WRAP))
-                preKeysArray.put(obj)
+            // Multi-device pairing: when the caller passes a pre-existing
+            // identity (linked device import via provisioning ciphertext),
+            // import it instead of generating a fresh one. Wire format is
+            // the combined libsignal IdentityKeyPair serialized blob (one
+            // base64), byte-for-byte identical with the iOS side.
+            //
+            // NOTE: the production multi-device path uses
+            // `consumeProvisioningPayload` instead, which keeps the imported
+            // identity confined to native code. This `existingIdentityKey`
+            // back door is retained for tests and edge-case tooling.
+            val importedIdentity: IdentityKeyPair? = existingIdentityKey?.let { existing ->
+                val serializedB64 = existing["serialized"]
+                    ?: throw Exception("existingIdentityKey must include base64 `serialized`")
+                val serializedBytes = Base64.decode(serializedB64, Base64.NO_WRAP)
+                IdentityKeyPair(serializedBytes)
             }
 
-            val kyberPreKeysArray = org.json.JSONArray()
-            keys.kyberPreKeys.forEach { kyberPreKey ->
-                val obj = org.json.JSONObject()
-                obj.put("id", kyberPreKey.id)
-                obj.put("publicKey", Base64.encodeToString(kyberPreKey.keyPair.publicKey.serialize(), Base64.NO_WRAP))
-                obj.put("signature", Base64.encodeToString(kyberPreKey.signature, Base64.NO_WRAP))
-                obj.put("key", Base64.encodeToString(kyberPreKey.serialize(), Base64.NO_WRAP))
-                kyberPreKeysArray.put(obj)
-            }
-
-            // 3. Save private data to protected storage
-            if (!keystoreHelper.saveProtected(identityKeyPairStorageKey, identityKeyPairData)) {
-                throw Exception("Failed to save identity key pair")
-            }
-
-            // 4. Save metadata to standard encrypted storage
-            val metadata = org.json.JSONObject()
-            metadata.put("registrationId", keys.registrationId)
-            metadata.put("deviceId", deviceId)
-            metadata.put("name", name)
-            metadata.put("signedPreKeyRecord", Base64.encodeToString(keys.signedPreKeyRecord.serialize(), Base64.NO_WRAP))
-            metadata.put("preKeys", preKeysArray)
-            metadata.put("kyberPreKeys", kyberPreKeysArray)
-
-            if (!keystoreHelper.save(localUserMetadataStorageKey, metadata.toString().toByteArray(Charsets.UTF_8))) {
-                keystoreHelper.deleteProtected(identityKeyPairStorageKey)
-                throw Exception("Failed to save metadata")
-            }
-
-            // 5. Initialize LocalUser in memory
-            val newLocalUser = LocalUser(
-                identityKey = keys.identityKeyPair,
-                registrationId = keys.registrationId.toUInt(),
-                preKeys = keys.preKeys,
-                signedPreKey = keys.signedPreKeyRecord,
-                kyberPreKeys = keys.kyberPreKeys,
-                deviceId = deviceId.toUInt(),
-                name = name
-            )
-            localUser = newLocalUser
-
-            // Populate shared stores with local user's keys immediately after creation
-            newLocalUser.preKeys.forEach { preKey ->
-                sharedPreKeyStore?.storePreKey(preKey.id, preKey)
-            }
-            sharedSignedPreKeyStore?.storeSignedPreKey(newLocalUser.signedPreKey.id, newLocalUser.signedPreKey)
-            newLocalUser.kyberPreKeys.forEach { kyberPreKey ->
-                sharedKyberPreKeyStore?.storeKyberPreKey(kyberPreKey.id, kyberPreKey)
-            }
-
-            // 6. Return ONLY public keys
-            val publicPreKeys = keys.preKeys.map { preKeyRecord ->
-                mapOf(
-                    "id" to preKeyRecord.id,
-                    "publicKey" to Base64.encodeToString(preKeyRecord.keyPair.publicKey.serialize(), Base64.NO_WRAP)
-                )
-            }
-
-            val publicKyberPreKeys = keys.kyberPreKeys.map { kyberPreKey ->
-                mapOf(
-                    "id" to kyberPreKey.id,
-                    "publicKey" to Base64.encodeToString(kyberPreKey.keyPair.publicKey.serialize(), Base64.NO_WRAP),
-                    "signature" to Base64.encodeToString(kyberPreKey.signature, Base64.NO_WRAP)
-                )
-            }
-
-            return@AsyncFunction mapOf(
-                "registrationId" to keys.registrationId,
-                "deviceId" to deviceId,
-                "identityPublicKey" to keys.identityKeyPublicBase64(),
-                "signedPreKey" to mapOf(
-                    "id" to keys.signedPreKeyId().toInt(),
-                    "publicKey" to keys.signedPreKeyPublicKeyBase64(),
-                    "signature" to keys.signedPreKeyRecordSignatureBase64()
-                ),
-                "preKeys" to publicPreKeys,
-                "kyberPreKeys" to publicKyberPreKeys
-            )
+            return@AsyncFunction performIdentitySetup(deviceId, name, importedIdentity)
         }
 
         AsyncFunction("getPublicIdentity") {
@@ -484,11 +611,15 @@ class SignalProtocolModule : Module() {
                 sharedKyberPreKeyStore!!,
                 context
             )
-            encryptedSessions[remoteUserId] = session
+            putEncryptedSession(remoteUserId, deviceId, session)
         }
 
         AsyncFunction("establishSession") { remoteUserId: String ->
-            if (encryptedSessions[remoteUserId] == null) {
+            // NOTE (multi-device): establishSession is invoked by JS after
+            // setRemoteUserKeys, which is keyed by (userId, deviceId). This
+            // status check falls back to the default deviceId=1 slot;
+            // multi-device callers can confirm via decryptMessage anyway.
+            if (getEncryptedSession(remoteUserId) == null) {
                 throw Exception("Session is not initialized. Set local and remote user keys first.")
             }
 
@@ -497,6 +628,18 @@ class SignalProtocolModule : Module() {
 
         AsyncFunction("resumeSession") { remoteUserId: String, remoteUserName: String, remoteUserDeviceId: Int ->
             val user = localUser ?: throw Exception("Local user not set. Ensure loadStoredLocalUser was called.")
+
+            // Memoization (frontend-0016): if a warm EncryptedSession already
+            // exists for this (userId, deviceId), reuse it instead of rebuilding.
+            // Reconstructing re-creates the per-session store wrappers and
+            // re-opens the encrypted stores on every encrypt; the warm instance
+            // already carries the Double Ratchet state, so overwriting it is
+            // pure overhead. Explicit rebuilds (recovery after a decrypt error,
+            // key rotation) go through setRemoteUserKeys, which always creates a
+            // fresh session — resumeSession is not the path for that.
+            if (getEncryptedSession(remoteUserId, remoteUserDeviceId) != null) {
+                return@AsyncFunction mapOf("status" to "Session already warm")
+            }
 
             // CRITICAL: Use remoteUserId as name for consistent identity key lookup
             val address = SignalProtocolAddress(remoteUserId, remoteUserDeviceId)
@@ -510,24 +653,32 @@ class SignalProtocolModule : Module() {
                 sharedKyberPreKeyStore!!,
                 context
             )
-            encryptedSessions[remoteUserId] = session
+            putEncryptedSession(remoteUserId, remoteUserDeviceId, session)
 
             return@AsyncFunction mapOf("status" to "Session resumed successfully")
         }
 
         // ========== ENCRYPTION/DECRYPTION ==========
 
-        AsyncFunction("encryptMessage") { message: String, remoteUserId: String ->
-            val session = encryptedSessions[remoteUserId]
-                ?: throw Exception("Session for remoteUserId $remoteUserId is not initialized.")
+        AsyncFunction("encryptMessage") { message: String, remoteUserId: String, remoteDeviceId: Int? ->
+            // Multi-device (ADR-0001 D4): look up the session by
+            // (userId, deviceId). Default deviceId=1 keeps single-device
+            // peers and not-yet-updated call sites working unchanged.
+            val effectiveDeviceId = remoteDeviceId ?: 1
+            val session = getEncryptedSession(remoteUserId, effectiveDeviceId)
+                ?: throw Exception("Session for remoteUserId $remoteUserId (device $effectiveDeviceId) is not initialized.")
 
             val encryptedMessage = session.encrypt(message)
             return@AsyncFunction mapOf("encryptedMessage" to encryptedMessage)
         }
 
         AsyncFunction("decryptMessage") { encryptedMessage: String, remoteUserId: String, deviceId: Int? ->
+            // Multi-device (ADR-0001 D4): use the sender's deviceId from the
+            // message envelope to find / create the (userId, deviceId) slot.
+            // Default 1 for backward-compat.
+            val effectiveDeviceId = deviceId ?: 1
             val session: EncryptedSession
-            val existing = encryptedSessions[remoteUserId]
+            val existing = getEncryptedSession(remoteUserId, effectiveDeviceId)
             if (existing != null) {
                 session = existing
             } else {
@@ -536,8 +687,7 @@ class SignalProtocolModule : Module() {
                 // pre-key stores to decrypt and establish the session automatically.
                 val user = localUser
                     ?: throw Exception("Local user not set. Ensure loadStoredLocalUser was called.")
-                // M-01 FIX: Use deviceId from message metadata, fallback to 1
-                val address = SignalProtocolAddress(remoteUserId, deviceId ?: 1)
+                val address = SignalProtocolAddress(remoteUserId, effectiveDeviceId)
                 session = EncryptedSession(
                     user, address, null, remoteUserId,
                     sharedPreKeyStore!!, sharedSignedPreKeyStore!!, sharedKyberPreKeyStore!!,
@@ -549,16 +699,217 @@ class SignalProtocolModule : Module() {
                 ?: throw Exception("Decrypted message is nil")
 
             // Decrypt succeeded — persist session (auto-established via PreKeySignalMessage)
-            encryptedSessions[remoteUserId] = session
+            putEncryptedSession(remoteUserId, effectiveDeviceId, session)
 
             return@AsyncFunction mapOf("message" to decryptedMessage)
+        }
+
+        // ========== MULTI-DEVICE PROVISIONING ==========
+        //
+        // X25519 ECDHE + HKDF-SHA256 + AES-256-GCM helpers used by the
+        // multi-device pairing flow. See _shared/api/multi-device-linking.md
+        // for the wire contract and _shared/decisions/0001-multi-device-architecture.md
+        // (ADR-0001 §D2) for the rationale.
+
+        AsyncFunction("generateProvisioningKeypair") {
+            val privateKey = ECPrivateKey.generate()
+            val publicKey = privateKey.getPublicKey()
+            return@AsyncFunction mapOf(
+                "publicKey" to Base64.encodeToString(publicKey.serialize(), Base64.NO_WRAP),
+                "privateKey" to Base64.encodeToString(privateKey.serialize(), Base64.NO_WRAP)
+            )
+        }
+
+        AsyncFunction("encryptProvisioning") {
+            plaintextBase64: String, recipientPublicKey: String, senderPrivateKey: String ->
+            val plaintext = Base64.decode(plaintextBase64, Base64.NO_WRAP)
+            val envelope = encryptProvisioningEnvelope(plaintext, recipientPublicKey, senderPrivateKey)
+            return@AsyncFunction mapOf(
+                "ciphertext" to Base64.encodeToString(envelope, Base64.NO_WRAP)
+            )
+        }
+
+        AsyncFunction("decryptProvisioning") {
+            ciphertextBase64: String, recipientPrivateKey: String, senderPublicKey: String ->
+            val plaintext = decryptProvisioningEnvelope(ciphertextBase64, recipientPrivateKey, senderPublicKey)
+            return@AsyncFunction mapOf(
+                "plaintext" to Base64.encodeToString(plaintext, Base64.NO_WRAP)
+            )
+        }
+
+        // High-level pairing wrappers — see ADR-0001 (Option B).
+        // The identity private key NEVER crosses the JS boundary.
+
+        AsyncFunction("encryptProvisioningPayload") {
+            recipientPublicKey: String, senderPrivateKey: String, primaryUserId: String, primaryName: String? ->
+            val keystoreHelper = KeystoreHelper.getInstance(context)
+            if (!keystoreHelper.isAuthenticated) {
+                throw Exception("Must authenticate before reading identity for pairing")
+            }
+            // Load the primary's identity from protected storage. Stays inside
+            // this function — consumed inline to build the payload and
+            // discarded (Kotlin GC) when the AsyncFunction returns.
+            val identityKeyPairData = keystoreHelper.loadProtected(identityKeyPairStorageKey)
+                ?: throw Exception("No identity stored — cannot produce a provisioning payload")
+            val identityKeyPair = IdentityKeyPair(identityKeyPairData)
+            val identityKeySerialized = Base64.encodeToString(identityKeyPair.serialize(), Base64.NO_WRAP)
+            val identityKeyPub = Base64.encodeToString(identityKeyPair.publicKey.serialize(), Base64.NO_WRAP)
+
+            val payload = org.json.JSONObject()
+            payload.put("v", 1)
+            payload.put("identityKeySerialized", identityKeySerialized)
+            payload.put("identityKeyPub", identityKeyPub)
+            payload.put("primaryUserId", primaryUserId)
+            if (primaryName != null) {
+                payload.put("primaryName", primaryName)
+            }
+            val plaintextBytes = payload.toString().toByteArray(Charsets.UTF_8)
+
+            val envelope = encryptProvisioningEnvelope(plaintextBytes, recipientPublicKey, senderPrivateKey)
+            return@AsyncFunction mapOf(
+                "ciphertext" to Base64.encodeToString(envelope, Base64.NO_WRAP)
+            )
+        }
+
+        AsyncFunction("peekProvisioningPayload") {
+            ciphertextBase64: String, recipientPrivateKey: String, senderPublicKey: String ->
+            // Decrypt and integrity-check the provisioning payload WITHOUT
+            // installing the identity. Used by the new device to compute the
+            // pairing safety number and show it to the user before committing
+            // anything to persistent state.
+            val plaintextBytes = decryptProvisioningEnvelope(ciphertextBase64, recipientPrivateKey, senderPublicKey)
+            val plaintextString = String(plaintextBytes, Charsets.UTF_8)
+            val parsed = try {
+                org.json.JSONObject(plaintextString)
+            } catch (e: Exception) {
+                throw Exception("Provisioning payload is not valid JSON")
+            }
+
+            val version = parsed.optInt("v", -1)
+            if (version != 1) {
+                throw Exception("Unsupported provisioning payload version")
+            }
+            val serializedB64 = parsed.optString("identityKeySerialized", "")
+            val identityPubB64 = parsed.optString("identityKeyPub", "")
+            val primaryUserId = parsed.optString("primaryUserId", "")
+            if (serializedB64.isEmpty() || identityPubB64.isEmpty() || primaryUserId.isEmpty()) {
+                throw Exception("Provisioning payload missing required fields")
+            }
+
+            // Integrity check: identityKeyPub must equal the public half of
+            // the deserialized keypair. Catches a tampered payload here, BEFORE
+            // we hand the resulting safety number to the user.
+            val serializedBytes = Base64.decode(serializedB64, Base64.NO_WRAP)
+            val importedIdentity = IdentityKeyPair(serializedBytes)
+            val recoveredPub = Base64.encodeToString(importedIdentity.publicKey.serialize(), Base64.NO_WRAP)
+            if (recoveredPub != identityPubB64) {
+                throw Exception("Provisioning payload integrity check failed: identityKeyPub does not match identityKeySerialized")
+            }
+
+            // `importedIdentity` and `serializedBytes` go out of scope here —
+            // the JVM GC will reclaim them. The private key is never persisted
+            // or returned to the JS layer.
+            val result = mutableMapOf<String, Any>(
+                "primaryUserId" to primaryUserId,
+                "identityKeyPub" to identityPubB64
+            )
+            val primaryName = parsed.optString("primaryName", "")
+            if (primaryName.isNotEmpty()) {
+                result["primaryName"] = primaryName
+            }
+            return@AsyncFunction result
+        }
+
+        AsyncFunction("consumeProvisioningPayload") {
+            ciphertextBase64: String, recipientPrivateKey: String, senderPublicKey: String, deviceId: Int, name: String ->
+            val keystoreHelper = KeystoreHelper.getInstance(context)
+            if (!keystoreHelper.isAuthenticated) {
+                throw Exception("Must authenticate before installing a provisioned identity")
+            }
+
+            val plaintextBytes = decryptProvisioningEnvelope(ciphertextBase64, recipientPrivateKey, senderPublicKey)
+            val plaintextString = String(plaintextBytes, Charsets.UTF_8)
+            val parsed = try {
+                org.json.JSONObject(plaintextString)
+            } catch (e: Exception) {
+                throw Exception("Provisioning payload is not valid JSON")
+            }
+
+            val version = parsed.optInt("v", -1)
+            if (version != 1) {
+                throw Exception("Unsupported provisioning payload version")
+            }
+            val serializedB64 = parsed.optString("identityKeySerialized", "")
+            val identityPubB64 = parsed.optString("identityKeyPub", "")
+            if (serializedB64.isEmpty() || identityPubB64.isEmpty()) {
+                throw Exception("Provisioning payload missing required fields")
+            }
+            val serializedBytes = Base64.decode(serializedB64, Base64.NO_WRAP)
+            val importedIdentity = IdentityKeyPair(serializedBytes)
+
+            // Cross-check: the embedded identityKeyPub MUST match the public
+            // key we recover from the serialized keypair. Detects a malformed
+            // or tampered payload before it reaches the Keystore.
+            val recoveredPub = Base64.encodeToString(importedIdentity.publicKey.serialize(), Base64.NO_WRAP)
+            if (recoveredPub != identityPubB64) {
+                throw Exception("Provisioning payload integrity check failed: identityKeyPub does not match identityKeySerialized")
+            }
+
+            return@AsyncFunction performIdentitySetup(deviceId, name, importedIdentity)
+        }
+
+        AsyncFunction("getPairingSafetyNumber") {
+            ephemeralPubA: String, ephemeralPubB: String, identityPub: String, primaryUserId: String ->
+
+            val aBytes = Base64.decode(ephemeralPubA, Base64.NO_WRAP)
+            val bBytes = Base64.decode(ephemeralPubB, Base64.NO_WRAP)
+            val idBytes = Base64.decode(identityPub, Base64.NO_WRAP)
+
+            // Transcript hash: SHA-256(A || B || identityPub)
+            val digest = MessageDigest.getInstance("SHA-256")
+            digest.update(aBytes)
+            digest.update(bBytes)
+            digest.update(idBytes)
+            val transcript = digest.digest()
+
+            // HKDF: salt = "tillit/pairing/sn/v1", info = primaryUserId, L = 30
+            val salt = "tillit/pairing/sn/v1".toByteArray(Charsets.UTF_8)
+            val info = primaryUserId.toByteArray(Charsets.UTF_8)
+            val snBytes = HKDF.deriveSecrets(transcript, salt, info, 30)
+
+            // 30 B → 6 blocks of 5 B → uint40 → mod 10^10 → 10 zero-padded digits → 60 total
+            val digits = StringBuilder(60)
+            for (blockIdx in 0 until 6) {
+                var v = 0L
+                for (byteIdx in 0 until 5) {
+                    v = (v shl 8) or (snBytes[blockIdx * 5 + byteIdx].toLong() and 0xFF)
+                }
+                v %= 10_000_000_000L
+                digits.append(String.format(Locale.US, "%010d", v))
+            }
+            // Format as 12 groups of 5 digits separated by single spaces.
+            val groups = StringBuilder()
+            for (i in 0 until 12) {
+                if (i > 0) groups.append(' ')
+                groups.append(digits.substring(i * 5, i * 5 + 5))
+            }
+            return@AsyncFunction mapOf("safetyNumber" to groups.toString())
+        }
+
+        // ========== REMOTE SESSION MANAGEMENT (multi-device revocation) ==========
+
+        AsyncFunction("deleteRemoteSession") { remoteUserId: String, remoteDeviceId: Int? ->
+            // Multi-device (ADR-0001 D6): drop only the session for the
+            // revoked (userId, deviceId). Other devices of the same peer
+            // keep encrypting/decrypting normally.
+            removeEncryptedSession(remoteUserId, remoteDeviceId ?: 1)
         }
 
         // ========== IDENTITY VERIFICATION ==========
 
         AsyncFunction("getSafetyNumber") { remoteUserId: String ->
             val user = localUser ?: throw Exception("Local user not set. Call loadStoredLocalUser first.")
-            val session = encryptedSessions[remoteUserId]
+            val session = getEncryptedSession(remoteUserId)
                 ?: throw Exception("Session for remoteUserId $remoteUserId is not initialized.")
 
             val remoteIdentity = session.identityStore.getIdentity(session.remoteAddress)
@@ -569,7 +920,7 @@ class SignalProtocolModule : Module() {
         }
 
         AsyncFunction("verifyIdentity") { remoteUserId: String ->
-            val session = encryptedSessions[remoteUserId]
+            val session = getEncryptedSession(remoteUserId)
                 ?: throw Exception("Session for remoteUserId $remoteUserId is not initialized.")
 
             val remoteIdentity = session.identityStore.getIdentity(session.remoteAddress)
@@ -581,7 +932,7 @@ class SignalProtocolModule : Module() {
 
         // H8 FIX: Full implementation with identity key comparison
         AsyncFunction("checkIdentityKeyChanged") { remoteUserId: String, identityKey: String? ->
-            val session = encryptedSessions[remoteUserId]
+            val session = getEncryptedSession(remoteUserId)
                 ?: throw Exception("Session for remoteUserId $remoteUserId is not initialized.")
 
             val storedIdentity = session.identityStore.getIdentity(session.remoteAddress)

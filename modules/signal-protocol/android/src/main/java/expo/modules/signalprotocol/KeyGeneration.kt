@@ -56,8 +56,13 @@ object KeyGeneration {
         return results
     }
 
-    fun generateKeys(): Registration {
-        val identityKeyPair = generateIdentityKeyPair()
+    fun generateKeys(existingIdentity: IdentityKeyPair? = null): Registration {
+        // Multi-device pairing: when an existing identity is provided (linked
+        // device import), reuse it instead of generating a fresh one. All the
+        // other keys (registration id, signed pre-key, pre-keys, kyber
+        // pre-keys) are still generated fresh per-device — only the user-level
+        // identity is shared across devices of the same user.
+        val identityKeyPair = existingIdentity ?: generateIdentityKeyPair()
         val registrationId = generateRegistrationId()
         val signedPreKeyId = secureRandom.nextInt(MAX_VAL - 2) + 1
         val signedPreKey = generateSignedPreKey(identityKeyPair, signedPreKeyId)

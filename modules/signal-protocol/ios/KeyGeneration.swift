@@ -71,8 +71,13 @@ struct KeyGeneration {
         return identityKeyPair.privateKey.generateSignature(message: message)
     }
 
-    static func generateKeys() throws -> Registration {
-        let identityKeyPair = generateIdentityKeyPair()
+    static func generateKeys(existingIdentity: IdentityKeyPair? = nil) throws -> Registration {
+        // Multi-device pairing: when an existing identity is provided (linked
+        // device import), reuse it instead of generating a fresh one. All the
+        // other keys (registration id, signed pre-key, pre-keys, kyber
+        // pre-keys) are still generated fresh per-device — only the user-level
+        // identity is shared across devices of the same user.
+        let identityKeyPair = existingIdentity ?? generateIdentityKeyPair()
         let registrationId = generateRegistrationId()
         let signedPreKeyId = UInt32.random(in: 1...maxVal - 1)
         let signedPreKey = try generateSignedPreKey(identityKeyPair: identityKeyPair, signedPreKeyId: signedPreKeyId)
