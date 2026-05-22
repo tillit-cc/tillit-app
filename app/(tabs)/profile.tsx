@@ -1,5 +1,5 @@
 import { useState, useEffect, useRef, useCallback } from 'react';
-import { View, Text, ScrollView, TextInput, Alert, Linking, Pressable } from 'react-native';
+import { View, Text, ScrollView, TextInput, Alert, Linking, Pressable, ActivityIndicator } from 'react-native';
 import { SafeAreaView } from 'react-native-safe-area-context';
 import { Ionicons } from '@expo/vector-icons';
 import { useTranslation } from 'react-i18next';
@@ -7,9 +7,12 @@ import { useRouter } from 'expo-router';
 import { Button } from '@/components/ui/Button';
 import { useAuthStore } from '@/stores/auth.store';
 import { useAppStore } from '@/stores/app.store';
+import { useDeviceStore } from '@/stores/device.store';
 import { appInitService } from '@/services/app-init.service';
+import { deviceService } from '@/services/device.service';
 import { profileRepository } from '@/db/repositories/profile.repository';
 import { logger } from '@/utils/logger';
+import type { DeviceInfo } from '@/types/device';
 import * as Application from 'expo-application';
 import * as Updates from 'expo-updates';
 
@@ -82,6 +85,58 @@ export default function ProfileScreen() {
       Alert.alert(t('common.error'), t('profile.privacyPolicyError'));
     }
   }, [t]);
+
+  // ===== Linked devices =====
+  const devices = useDeviceStore((s) => s.devices);
+  const loadingDevices = useDeviceStore((s) => s.loadingDevices);
+
+  useEffect(() => {
+    deviceService.loadDevices().catch((err) => {
+      logger.warn('[Profile] loadDevices failed:', err?.message ?? err);
+    });
+  }, []);
+
+  const handleLinkNewDevice = useCallback(() => {
+    router.push('/link-device');
+  }, [router]);
+
+  const handleRevokeDevice = useCallback(
+    (device: DeviceInfo) => {
+      if (device.isPrimary) return;
+      Alert.alert(
+        t('linkedDevices.revokeTitle'),
+        t('linkedDevices.revokeMsg', { name: device.deviceName }),
+        [
+          { text: t('common.cancel'), style: 'cancel' },
+          {
+            text: t('linkedDevices.revoke'),
+            style: 'destructive',
+            onPress: async () => {
+              try {
+                await deviceService.revokeDevice(device.deviceId);
+              } catch (err) {
+                logger.warn('[Profile] revokeDevice failed:', err);
+                Alert.alert(t('common.error'), t('linkedDevices.revokeError'));
+              }
+            },
+          },
+        ],
+      );
+    },
+    [t],
+  );
+
+  const formatLastSeen = useCallback(
+    (iso: string | null): string => {
+      if (!iso) return t('linkedDevices.lastSeenNever');
+      try {
+        return new Date(iso).toLocaleString();
+      } catch {
+        return iso;
+      }
+    },
+    [t],
+  );
 
   const handleDeleteAccount = useCallback(() => {
     Alert.alert(
@@ -171,6 +226,84 @@ export default function ProfileScreen() {
               </Text>
             </View>
           ) : null}
+        </View>
+
+        {/* Linked devices Section */}
+        <View className="mt-4 bg-white dark:bg-gray-900 px-4 py-3">
+          <Text className="text-xs font-semibold text-gray-500 dark:text-gray-400 uppercase tracking-wide mb-1">
+            {t('linkedDevices.section')}
+          </Text>
+          <Text className="text-xs text-gray-400 dark:text-gray-500 mb-3">
+            {t('linkedDevices.sectionDescription')}
+          </Text>
+
+          {loadingDevices && devices.length === 0 ? (
+            <View className="py-6 items-center">
+              <ActivityIndicator />
+            </View>
+          ) : devices.length === 0 ? (
+            <Text className="text-sm text-gray-500 dark:text-gray-400 py-2">
+              {t('linkedDevices.noLinked')}
+            </Text>
+          ) : (
+            <View>
+              {devices
+                .filter((d) => d.status !== 'revoked')
+                .map((device) => (
+                  <View
+                    key={device.deviceId}
+                    className="flex-row items-center justify-between py-3 border-b border-gray-100 dark:border-gray-800 last:border-b-0"
+                  >
+                    <View className="flex-1 mr-3">
+                      <View className="flex-row items-center gap-2">
+                        <Text className="text-base text-gray-900 dark:text-white font-medium">
+                          {device.deviceName}
+                        </Text>
+                        {device.isPrimary ? (
+                          <View className="px-2 py-0.5 bg-blue-100 dark:bg-blue-900 rounded">
+                            <Text className="text-xs text-blue-700 dark:text-blue-300">
+                              {t('linkedDevices.primaryBadge')}
+                            </Text>
+                          </View>
+                        ) : null}
+                        {device.isCurrent ? (
+                          <View className="px-2 py-0.5 bg-green-100 dark:bg-green-900 rounded">
+                            <Text className="text-xs text-green-700 dark:text-green-300">
+                              {t('linkedDevices.thisDevice')}
+                            </Text>
+                          </View>
+                        ) : null}
+                      </View>
+                      <Text className="text-xs text-gray-500 dark:text-gray-400 mt-1">
+                        {t('linkedDevices.lastSeen')}: {formatLastSeen(device.lastSeen)}
+                      </Text>
+                    </View>
+                    {!device.isPrimary && !device.isCurrent ? (
+                      <Pressable
+                        onPress={() => handleRevokeDevice(device)}
+                        accessibilityRole="button"
+                        accessibilityLabel={t('linkedDevices.revoke')}
+                        className="px-3 py-2"
+                        hitSlop={8}
+                      >
+                        <Ionicons name="trash-outline" size={20} color="#ef4444" />
+                      </Pressable>
+                    ) : null}
+                  </View>
+                ))}
+            </View>
+          )}
+
+          <View className="mt-3">
+            <Button
+              onPress={handleLinkNewDevice}
+              variant="outline"
+              size="md"
+              icon={<Ionicons name="qr-code-outline" size={20} color="#3b82f6" />}
+            >
+              <Text className="text-blue-500 font-semibold">{t('linkedDevices.linkNewDevice')}</Text>
+            </Button>
+          </View>
         </View>
 
         {/* Privacy & legal Section */}

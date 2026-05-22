@@ -378,9 +378,16 @@ export default function LoginScreen() {
                 {t('auth.secureMessages')}
               </Text>
 
-              <View className="w-full">
+              <View className="w-full gap-3">
                 <Button onPress={wipeAndCreate} size="lg">
                   {t('auth.createIdentity')}
+                </Button>
+                <Button
+                  onPress={() => router.push('/claim-device')}
+                  variant="outline"
+                  size="lg"
+                >
+                  {t('linkedDevices.claimTitle')}
                 </Button>
               </View>
             </View>
