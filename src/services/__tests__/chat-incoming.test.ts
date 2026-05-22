@@ -75,6 +75,8 @@ jest.mock('../session.service', () => ({
     deleteSessionsByRoom: jest.fn().mockResolvedValue(undefined),
     loadSessions: jest.fn().mockResolvedValue([]),
     initializePreKeyTracking: jest.fn().mockResolvedValue(undefined),
+    getRemoteDeviceIds: jest.fn(() => [] as number[]),
+    fetchAllRemoteBundles: jest.fn().mockResolvedValue([]),
   },
 }));
 
@@ -104,9 +106,9 @@ jest.mock('../media-crypto.service', () => ({
   mediaCryptoService: { encrypt: jest.fn(), decrypt: jest.fn() },
 }));
 
-const mockChatStore = { currentRoomId: null as number | null, messages: new Map(), allRooms: [] as any[], addMessage: jest.fn(), updateMessage: jest.fn(), removeMessage: jest.fn(), setMessages: jest.fn(), prependMessages: jest.fn(), replaceMessageId: jest.fn(), addRoomToList: jest.fn(), updateRoomInList: jest.fn(), removeRoomFromList: jest.fn(), clearRoom: jest.fn(), clearAll: jest.fn(), setAllRooms: jest.fn(), setProfiles: jest.fn(), updateProfile: jest.fn(), setTyping: jest.fn(), setPaginationState: jest.fn() };
+const mockChatStore = { currentRoomId: null as number | null, messages: new Map(), allRooms: [] as any[], profiles: new Map(), addMessage: jest.fn(), updateMessage: jest.fn(), removeMessage: jest.fn(), setMessages: jest.fn(), prependMessages: jest.fn(), replaceMessageId: jest.fn(), addRoomToList: jest.fn(), updateRoomInList: jest.fn(), removeRoomFromList: jest.fn(), clearRoom: jest.fn(), clearAll: jest.fn(), setAllRooms: jest.fn(), setProfiles: jest.fn(), updateProfile: jest.fn(), setTyping: jest.fn(), setPaginationState: jest.fn() };
 jest.mock('@/stores/chat.store', () => ({ useChatStore: { getState: jest.fn(() => mockChatStore) } }));
-jest.mock('@/stores/auth.store', () => ({ useAuthStore: { getState: jest.fn(() => ({ isAuthenticated: true, userId: 42 })) } }));
+jest.mock('@/stores/auth.store', () => ({ useAuthStore: { getState: jest.fn(() => ({ isAuthenticated: true, userId: 42, deviceId: 1 })) } }));
 jest.mock('@/stores/server.store', () => ({ useServerStore: { getState: jest.fn(() => ({ setConnectionState: jest.fn() })) } }));
 jest.mock('@/utils/logger', () => ({ logger: { info: jest.fn(), warn: jest.fn(), error: jest.fn() } }));
 jest.mock('@/utils/image', () => ({ generateThumbnailFromBase64: jest.fn(), saveImageToFile: jest.fn().mockResolvedValue('/path/to/image.jpg'), deleteImagesByMessageIds: jest.fn(), readImageAsBase64: jest.fn() }));
@@ -115,6 +117,7 @@ import { chatService } from '../chat.service';
 import SignalProtocol from 'signal-protocol';
 import { messageRepository } from '@/db/repositories/message.repository';
 import { roomRepository } from '@/db/repositories/room.repository';
+import * as Haptics from 'expo-haptics';
 
 // Typed references to the mocked repositories for assertions
 const mockMessageRepo = messageRepository as jest.Mocked<typeof messageRepository>;
@@ -146,12 +149,30 @@ describe('ChatService — handleIncomingMessage', () => {
     };
   }
 
-  it('skips own messages (id_user_from === userId)', async () => {
-    const envelope = makeEnvelope({ id_user_from: 42 });
+  it('skips own echoes (id_user_from === userId AND device_id_from === ownDeviceId)', async () => {
+    const envelope = makeEnvelope({ id_user_from: 42, device_id_from: 1 });
     await (chatService as any).handleIncomingMessage(envelope);
 
-    // Own messages are skipped synchronously before enqueueing
+    // True echo of our own send: skipped synchronously before enqueueing
     expect(mockMessageRepo.create).not.toHaveBeenCalled();
+  });
+
+  it('does NOT skip self-fanout from another linked device (id_user_from === userId, device_id_from !== ownDeviceId)', async () => {
+    const envelope = makeEnvelope({ id: 'self-fanout-1', id_user_from: 42, device_id_from: 4 });
+    await (chatService as any).handleIncomingMessage(envelope);
+
+    // Self-fanout copies authored by another linked device must be enqueued
+    // (the dedup key gets registered) so the message renders on this device.
+    expect((chatService as any).processingMessages.has('user:self-fanout-1')).toBe(true);
+  });
+
+  it('does NOT skip when device_id_from is missing — let downstream dedup handle echoes', async () => {
+    const envelope = makeEnvelope({ id: 'no-device-id', id_user_from: 42 });
+    await (chatService as any).handleIncomingMessage(envelope);
+
+    // Without explicit device_id_from we cannot tell echo from self-fanout;
+    // enqueue and rely on messageRepository.findById to dedup real echoes.
+    expect((chatService as any).processingMessages.has('user:no-device-id')).toBe(true);
   });
 
   it('deduplicates same message id', async () => {
@@ -183,7 +204,7 @@ describe('ChatService — handleIncomingMessage', () => {
     await (chatService as any).handleUserMessage(envelope, 100);
 
     // Should decrypt the message
-    expect((SignalProtocol as any).decryptMessage).toHaveBeenCalledWith('encrypted-body', '99');
+    expect((SignalProtocol as any).decryptMessage).toHaveBeenCalledWith('encrypted-body', '99', null);
 
     // Should store the message
     expect(mockMessageRepo.create).toHaveBeenCalledWith(
@@ -200,6 +221,33 @@ describe('ChatService — handleIncomingMessage', () => {
       100,
       expect.objectContaining({ id: 'user-msg-1' })
     );
+  });
+
+  it('sender-key self-fanout from another linked device → status SENT, no receipt, no haptic', async () => {
+    const envelope = makeEnvelope({
+      id: 'sk-self-fanout-1',
+      category: 'senderkey_message',
+      type: 'text',
+      id_user_from: 42, // own userId — fan-out from a linked device of mine
+      device_id_from: 4,
+      payload: { ciphertext: 'sk-ciphertext' },
+    });
+
+    await (chatService as any).handleSenderKeyMessage(envelope, 100);
+
+    expect(mockMessageRepo.create).toHaveBeenCalledWith(
+      expect.objectContaining({
+        id: 'sk-self-fanout-1',
+        idUserFrom: 42,
+        idStatus: MessageStatus.SENT,
+        read: expect.any(Number),
+      })
+    );
+
+    // No delivery/read receipt back to ourselves
+    expect(mockSocket.sendPacket).not.toHaveBeenCalled();
+    // No haptic for self-fanout (we authored this message)
+    expect((Haptics.notificationAsync as jest.Mock)).not.toHaveBeenCalled();
   });
 
   it('routes "system" category to handleSystemMessage', async () => {
@@ -235,5 +283,42 @@ describe('ChatService — handleIncomingMessage', () => {
 
     // TYPING_STARTED should set typing indicator
     expect(mockChatStore.setTyping).toHaveBeenCalledWith(100, 99, true);
+  });
+});
+
+describe('ChatService — extractCiphertextForSelf', () => {
+  const extract = (envelope: any, ids: Array<string | number | null | undefined>) =>
+    (chatService as any).extractCiphertextForSelf(envelope, ids);
+
+  it('returns the raw string when payload is the per-device ciphertext (multi-device fan-out)', () => {
+    const envelope = { payload: 'base64-ciphertext-xyz' };
+    expect(extract(envelope, [42])).toBe('base64-ciphertext-xyz');
+  });
+
+  it('returns null when payload is an empty string', () => {
+    const envelope = { payload: '' };
+    expect(extract(envelope, [42])).toBeNull();
+  });
+
+  it('returns ciphertext for matching userId from payload.recipients[]', () => {
+    const envelope = {
+      payload: {
+        recipients: [
+          { userId: 99, ciphertext: 'for-99' },
+          { userId: 42, ciphertext: 'for-42' },
+        ],
+      },
+    };
+    expect(extract(envelope, [42])).toBe('for-42');
+  });
+
+  it('falls back to legacy payload.body map keyed by userId', () => {
+    const envelope = { payload: { body: { '42': 'legacy-ciphertext' } } };
+    expect(extract(envelope, [42])).toBe('legacy-ciphertext');
+  });
+
+  it('returns null when nothing matches', () => {
+    const envelope = { payload: { body: { '99': 'not-for-me' } } };
+    expect(extract(envelope, [42])).toBeNull();
   });
 });

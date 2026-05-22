@@ -20,7 +20,97 @@ export const CHAT_EVENTS = {
   UserOnline: 'userOnline',
   RoomDeleted: 'roomDeleted',
   UserLeftRoom: 'userLeftRoom',
+  DeviceLinked: 'deviceLinked',
+  DeviceRevoked: 'deviceRevoked',
+  PeerDeviceLinked: 'peerDeviceLinked',
 } as const;
+
+/** Payload of the `deviceLinked` socket event. */
+export interface DeviceLinkedEvent {
+  deviceId: number;
+  deviceName: string;
+  linkedAt: string;
+}
+
+/**
+ * Payload of the `deviceRevoked` socket event. The discriminator `self`
+ * distinguishes:
+ *   - `self: true`  → this socket's own device has been revoked. Force logout.
+ *   - `self: false` → a peer revoked one of their devices. Drop the
+ *     `(userId, revokedDeviceId)` session locally.
+ */
+export type DeviceRevokedEvent =
+  | { self: true; revokedDeviceId: number; byUserId: string | number; revokedAt: string }
+  | { self: false; userId: string | number; revokedDeviceId: number; revokedAt: string };
+
+/**
+ * Payload of the `peerDeviceLinked` socket event (frontend-0008 / backend-0009).
+ *
+ * Emitted by the backend to every peer of a user who just completed a
+ * multi-device link. Receivers should invalidate their local `deviceMap`
+ * cache for `userId` so the next outgoing message includes a ciphertext
+ * for the newly-added device.
+ *
+ * Contract: `_shared/api/peer-device-linked.md`.
+ */
+export interface PeerDeviceLinkedEvent {
+  userId: string | number;
+  addedDeviceId: number;
+  linkedAt: string;
+}
+
+/**
+ * Per-device recipient for the multi-device fan-out wire shape.
+ *
+ * Each entry carries the libsignal ciphertext encrypted for one exact
+ * `(userId, deviceId)` pair. The array travels **top-level** in the
+ * `sendMessage` payload — the backend gateway only routes to its per-device
+ * fan-out path (`fanOutToRecipients`) when `recipients` is top-level, never
+ * when it is nested inside `message`. See
+ * `_shared/specs/multidevice-send-wire-shape.md`.
+ */
+export interface RecipientFanout {
+  userId: number;
+  deviceId: number;
+  ciphertext: string;
+}
+
+/**
+ * Per-device recipient for the multi-device fan-out wire shape of control
+ * packets (`sendPacket`). Each entry carries a full per-device envelope with
+ * SOLO the ciphertext encrypted for one `(userId, deviceId)`. The array
+ * travels **top-level** — the backend gateway only routes to
+ * `fanOutPacketToRecipients` when `recipients` is top-level, never when
+ * nested inside `packet`. See spec § "Control packets (`sendPacket`)".
+ */
+export interface PacketRecipientFanout {
+  userId: number;
+  deviceId: number;
+  packet: MessageEnvelope | Record<string, unknown>;
+}
+
+/**
+ * Envelope-level metadata that must survive the per-device fan-out.
+ *
+ * In the fan-out shape the per-device ciphertext replaces the whole
+ * envelope, so the wire-relevant fields (`id_parent` for reply threading,
+ * `version`) are carried out-of-band here; the backend re-applies them when
+ * it rebuilds each recipient's envelope.
+ */
+export interface SendMessageMetadata {
+  id_parent?: string;
+  version?: string;
+}
+
+/** Acknowledgement returned by the server for a `sendMessage` emit. */
+export interface SendMessageAck {
+  success: boolean;
+  delivered?: boolean;
+  messageId?: string;
+  id?: string;
+  timestamp?: string;
+  error?: string;
+}
 
 // Event handlers type
 type MessageHandler = (envelope: MessageEnvelope) => void | Promise<void>;
@@ -43,6 +133,9 @@ export class SocketService {
   private authErrorHandlers: (() => void)[] = [];
   private roomDeletedHandlers: ((data: { roomId: number; deletedBy: number; timestamp: number }) => void)[] = [];
   private userLeftRoomHandlers: ((data: { roomId: number; userId: number; timestamp: number }) => void)[] = [];
+  private deviceLinkedHandlers: ((data: DeviceLinkedEvent) => void)[] = [];
+  private deviceRevokedHandlers: ((data: DeviceRevokedEvent) => void)[] = [];
+  private peerDeviceLinkedHandlers: ((data: PeerDeviceLinkedEvent) => void)[] = [];
 
   /**
    * Token getter: injected by ServerRegistry to read the right per-server token.
@@ -146,6 +239,27 @@ export class SocketService {
     };
   }
 
+  onDeviceLinked(handler: (data: DeviceLinkedEvent) => void): () => void {
+    this.deviceLinkedHandlers.push(handler);
+    return () => {
+      this.deviceLinkedHandlers = this.deviceLinkedHandlers.filter((h) => h !== handler);
+    };
+  }
+
+  onDeviceRevoked(handler: (data: DeviceRevokedEvent) => void): () => void {
+    this.deviceRevokedHandlers.push(handler);
+    return () => {
+      this.deviceRevokedHandlers = this.deviceRevokedHandlers.filter((h) => h !== handler);
+    };
+  }
+
+  onPeerDeviceLinked(handler: (data: PeerDeviceLinkedEvent) => void): () => void {
+    this.peerDeviceLinkedHandlers.push(handler);
+    return () => {
+      this.peerDeviceLinkedHandlers = this.peerDeviceLinkedHandlers.filter((h) => h !== handler);
+    };
+  }
+
   // Update connection state and notify handlers
   private updateState(state: SocketConnectionState) {
     this.connectionState = state;
@@ -239,6 +353,9 @@ export class SocketService {
     this.authErrorHandlers = [];
     this.roomDeletedHandlers = [];
     this.userLeftRoomHandlers = [];
+    this.deviceLinkedHandlers = [];
+    this.deviceRevokedHandlers = [];
+    this.peerDeviceLinkedHandlers = [];
   }
 
   // Attach socket listeners
@@ -335,6 +452,19 @@ export class SocketService {
     this.socket.on(CHAT_EVENTS.UserLeftRoom, (data: any) => {
       this.userLeftRoomHandlers.forEach((handler) => handler(data));
     });
+
+    // Multi-device pairing/revocation notifications
+    this.socket.on(CHAT_EVENTS.DeviceLinked, (data: DeviceLinkedEvent) => {
+      this.deviceLinkedHandlers.forEach((handler) => handler(data));
+    });
+
+    this.socket.on(CHAT_EVENTS.DeviceRevoked, (data: DeviceRevokedEvent) => {
+      this.deviceRevokedHandlers.forEach((handler) => handler(data));
+    });
+
+    this.socket.on(CHAT_EVENTS.PeerDeviceLinked, (data: PeerDeviceLinkedEvent) => {
+      this.peerDeviceLinkedHandlers.forEach((handler) => handler(data));
+    });
   }
 
   // Detach socket listeners
@@ -348,7 +478,7 @@ export class SocketService {
   private extractEnvelope(data: any, kind: 'message' | 'packet'): MessageEnvelope | null {
     const candidate = kind === 'message' ? data?.message : data?.packet;
 
-    const normalized = this.normalizeEnvelopeCandidate(candidate);
+    const normalized = this.normalizeEnvelopeCandidate(candidate, data);
     if (normalized) return normalized;
 
     if (candidate) {
@@ -367,25 +497,48 @@ export class SocketService {
     );
   }
 
-  private normalizeEnvelopeCandidate(candidate: any): MessageEnvelope | null {
+  private normalizeEnvelopeCandidate(candidate: any, wrapper?: any): MessageEnvelope | null {
     if (!candidate) return null;
 
     if (candidate.category && candidate.id_room) {
       if (!this.isValidEnvelope(candidate)) return null;
+      this.liftWrapperFields(candidate, wrapper);
       return candidate as MessageEnvelope;
     }
 
     if (candidate.message?.category && candidate.message?.id_room) {
       if (!this.isValidEnvelope(candidate.message)) return null;
+      this.liftWrapperFields(candidate.message, wrapper ?? candidate);
       return candidate.message as MessageEnvelope;
     }
 
     if (candidate.packet?.category && candidate.packet?.id_room) {
       if (!this.isValidEnvelope(candidate.packet)) return null;
+      this.liftWrapperFields(candidate.packet, wrapper ?? candidate);
       return candidate.packet as MessageEnvelope;
     }
 
     return null;
+  }
+
+  // Lift wrapper-level camelCase fields onto an as-is envelope when the
+  // envelope itself doesn't carry them. Today this is the asymmetric
+  // wire shape from desktop/server: the wrapper has `senderDeviceId`
+  // (camelCase) while the envelope is otherwise snake_case and may omit
+  // `device_id_from`. Same idea for `idParent`. Without this lift, a
+  // multi-device peer's control packet would decrypt against the wrong
+  // session (deviceId=1 fallback) and fail silently.
+  private liftWrapperFields(envelope: any, wrapper: any): void {
+    if (!wrapper || wrapper === envelope) return;
+    if (envelope.device_id_from == null && typeof wrapper.senderDeviceId === 'number') {
+      envelope.device_id_from = wrapper.senderDeviceId;
+    }
+    if (envelope.id_parent == null) {
+      const camel = wrapper.idParent;
+      if (typeof camel === 'string' && camel.length > 0) {
+        envelope.id_parent = camel;
+      }
+    }
   }
 
   private normalizeFromSocketWrapper(wrapper: any, payload: any): MessageEnvelope | null {
@@ -406,7 +559,7 @@ export class SocketService {
       device_id_from: wrapper.senderDeviceId,
       id_user_to: payload?.id_user_to,
       encrypted: payload?.encrypted,
-      id_parent: payload?.id_parent,
+      id_parent: payload?.id_parent ?? payload?.idParent ?? wrapper?.idParent ?? null,
       version: payload?.version || wrapper.version || '2.0',
     } as MessageEnvelope;
   }
@@ -458,37 +611,128 @@ export class SocketService {
     await this.emit(CHAT_EVENTS.LeaveRoom, { roomId });
   }
 
-  // Send a message
-  async sendMessage(
-    roomId: number,
-    envelope: MessageEnvelope,
-    category: string,
-    type: string
-  ): Promise<{ success: boolean; delivered?: boolean; messageId?: string; id?: string; timestamp?: string; error?: string }> {
+  /**
+   * Send a message. Two wire shapes, discriminated by the args object:
+   *
+   *  - **Fan-out** (`recipients[]`): per-device multi-device delivery. The
+   *    backend routes to `fanOutToRecipients` ONLY when `recipients` is
+   *    top-level. Used by the pair-wise / encrypted path.
+   *  - **Legacy** (`message`): a single envelope with one ciphertext for the
+   *    whole room. Used by the sender-key path.
+   *
+   * `recipients[]` must never be nested inside `message` — that drops the
+   * send onto the legacy single-broadcast path, which filters by `userId`,
+   * so the sender's own other devices never receive it. Contract:
+   * `_shared/specs/multidevice-send-wire-shape.md`.
+   */
+  async sendMessage(args: {
+    roomId: number;
+    id?: string;
+    recipients: RecipientFanout[];
+    metadata?: SendMessageMetadata;
+    category: string;
+    type: string;
+    volatile?: boolean;
+  }): Promise<SendMessageAck>;
+  async sendMessage(args: {
+    roomId: number;
+    message: MessageEnvelope | Record<string, unknown>;
+    category: string;
+    type: string;
+    volatile?: boolean;
+  }): Promise<SendMessageAck>;
+  async sendMessage(args: {
+    roomId: number;
+    id?: string;
+    recipients?: RecipientFanout[];
+    message?: MessageEnvelope | Record<string, unknown>;
+    metadata?: SendMessageMetadata;
+    category: string;
+    type: string;
+    volatile?: boolean;
+  }): Promise<SendMessageAck> {
     if (!this.isConnected()) {
       throw new Error('Socket not connected');
     }
 
-    return this.emit(CHAT_EVENTS.SendMessage, {
-      roomId,
-      message: envelope,
-      category,
-      type,
-    });
+    const payload: Record<string, unknown> = {
+      roomId: args.roomId,
+      category: args.category,
+      type: args.type,
+    };
+    if (args.volatile) payload.volatile = true;
+
+    if (args.recipients) {
+      // Pass the client-generated envelope id through to the backend so the
+      // base id used by `fanOutToRecipients` matches the id stored locally
+      // by the sender — without this, delivery/read receipts (which carry
+      // the backend-minted id) miss the local row. See
+      // _shared/tasks/frontend-0017-clientmessageid-on-send.md. Requires
+      // backend-0016 to honor the field; backend is back-compat (mints a
+      // fresh id when `id` is absent).
+      if (typeof args.id === 'string' && args.id.length > 0) payload.id = args.id;
+      payload.recipients = args.recipients;
+      if (args.metadata && (args.metadata.id_parent || args.metadata.version)) {
+        payload.metadata = args.metadata;
+      }
+    } else {
+      payload.message = args.message;
+    }
+
+    return this.emit<SendMessageAck>(CHAT_EVENTS.SendMessage, payload);
   }
 
-  // Send a control packet
+  /**
+   * Send a control packet. Two wire shapes, discriminated by the first arg:
+   *
+   *  - **Fan-out** (object arg `{ roomId, recipients[], volatile? }`):
+   *    per-device multi-device delivery via `fanOutPacketToRecipients`.
+   *    Each `recipients[]` entry carries a full per-device envelope.
+   *  - **Legacy** (positional args `roomId, envelope, recipientIds?, …`):
+   *    a single envelope broadcast to the room — falls onto
+   *    `deliverPacketToRecipientIds` which filters by `userId` only and so
+   *    drops the receipt on the sender's own other devices. Kept for the
+   *    sender-key path (group-wide ciphertext, decryptable by every member).
+   *
+   * Contract: `_shared/specs/multidevice-send-wire-shape.md` § "Control
+   * packets (`sendPacket`)".
+   */
+  async sendPacket(args: {
+    roomId: number;
+    recipients: PacketRecipientFanout[];
+    volatile?: boolean;
+  }): Promise<{ success: boolean; delivered?: boolean; packetId?: string; timestamp?: string; error?: string }>;
   async sendPacket(
     roomId: number,
     envelope: MessageEnvelope,
     recipientIds?: number[],
     volatile?: boolean
-  ): Promise<{ success: boolean; error?: string }> {
+  ): Promise<{ success: boolean; error?: string }>;
+  async sendPacket(
+    roomIdOrArgs:
+      | number
+      | { roomId: number; recipients: PacketRecipientFanout[]; volatile?: boolean },
+    envelope?: MessageEnvelope,
+    recipientIds?: number[],
+    volatile?: boolean,
+  ): Promise<{ success: boolean; delivered?: boolean; packetId?: string; timestamp?: string; error?: string }> {
     if (!this.isConnected()) {
       throw new Error('Socket not connected');
     }
 
-    logger.info(`[Socket:${this.serverId}] -> sendPacket room:`, roomId, 'category:', envelope.category, 'to:', recipientIds, 'volatile:', !!volatile);
+    if (typeof roomIdOrArgs === 'object' && Array.isArray(roomIdOrArgs.recipients)) {
+      const args = roomIdOrArgs;
+      logger.info(`[Socket:${this.serverId}] -> sendPacket fan-out room:`, args.roomId, 'recipients:', args.recipients.length, 'volatile:', !!args.volatile);
+      const payload: Record<string, unknown> = {
+        roomId: args.roomId,
+        recipients: args.recipients,
+      };
+      if (args.volatile) payload.volatile = true;
+      return this.emit(CHAT_EVENTS.SendPacket, payload);
+    }
+
+    const roomId = roomIdOrArgs as number;
+    logger.info(`[Socket:${this.serverId}] -> sendPacket room:`, roomId, 'category:', envelope?.category, 'to:', recipientIds, 'volatile:', !!volatile);
     return this.emit(CHAT_EVENTS.SendPacket, {
       roomId,
       packet: envelope,

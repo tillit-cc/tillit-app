@@ -55,6 +55,18 @@ class AppInitService {
     await initDatabase();
     logger.info('[AppInit] Step 0a: OK');
 
+    // --- Step 0a': Cache local deviceId (best-effort) ---
+    // Reads `getPublicIdentity().deviceId` and stores it in auth.store so the
+    // multi-device send path can skip self when fanning out. Best-effort:
+    // if the identity hasn't been unlocked yet (rare, since bootstrap runs
+    // post biometric auth) the cache stays null and self-fan-out falls back
+    // to the PRIMARY_DEVICE_ID heuristic.
+    try {
+      await useAuthStore.getState().refreshDeviceId();
+    } catch (err) {
+      logger.warn('[AppInit] refreshDeviceId failed (non-blocking):', err);
+    }
+
     // Inject auth callbacks into serverRegistry to break the require cycle
     // (serverRegistry must not import auth.store directly)
     serverRegistry.setAuthCallbacks({

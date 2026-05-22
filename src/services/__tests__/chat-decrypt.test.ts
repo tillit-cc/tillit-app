@@ -48,6 +48,8 @@ jest.mock('../session.service', () => ({
     deleteSessionsByRoom: jest.fn().mockResolvedValue(undefined),
     loadSessions: jest.fn().mockResolvedValue([]),
     initializePreKeyTracking: jest.fn().mockResolvedValue(undefined),
+    getRemoteDeviceIds: jest.fn(() => [] as number[]),
+    fetchAllRemoteBundles: jest.fn().mockResolvedValue([]),
   },
 }));
 
@@ -106,7 +108,8 @@ describe('ChatService — decrypt', () => {
     expect(result).toBe(plaintext);
     expect((SignalProtocol as any).decryptMessage).toHaveBeenCalledWith(
       'encrypted-body',
-      '99'
+      '99',
+      null,
     );
   });
 
@@ -118,7 +121,7 @@ describe('ChatService — decrypt', () => {
 
     await (chatService as any).decrypt('encrypted-body', 100, 99);
 
-    expect(sessionService.ensureSessionInDatabase).toHaveBeenCalledWith(100, '99');
+    expect(sessionService.ensureSessionInDatabase).toHaveBeenCalledWith(100, '99', undefined);
     expect(sessionService.updateSessionTimestamp).toHaveBeenCalledWith(100, '99');
   });
 

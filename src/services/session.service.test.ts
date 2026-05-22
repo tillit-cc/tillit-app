@@ -89,6 +89,8 @@ function resetServiceState() {
   (sessionService as any).refreshLocks = new Set();
   (sessionService as any).lastRefreshTime = new Map();
   (sessionService as any).deviceId = 1;
+  (sessionService as any).deviceMap = new Map();
+  (sessionService as any).lastDeviceMapRefresh = new Map();
 }
 
 function makeSession(overrides: Record<string, any> = {}) {
@@ -319,7 +321,7 @@ describe('SessionService', () => {
   // 13. ensureSessionInDatabase: creates if not existing
   // ==========================================================================
   it('ensureSessionInDatabase creates session if not existing', async () => {
-    mockSessionRepo.findByUserAndRoom.mockResolvedValue(null);
+    mockSessionRepo.findByUserRoomAndDevice.mockResolvedValue(null);
     mockSessionRepo.findByRoom.mockResolvedValue([]);
 
     await sessionService.ensureSessionInDatabase(10, '99');
@@ -339,11 +341,30 @@ describe('SessionService', () => {
   // 14. ensureSessionInDatabase: skips if already exists
   // ==========================================================================
   it('ensureSessionInDatabase skips if session already exists', async () => {
-    mockSessionRepo.findByUserAndRoom.mockResolvedValue(makeSession());
+    mockSessionRepo.findByUserRoomAndDevice.mockResolvedValue(makeSession());
 
     await sessionService.ensureSessionInDatabase(10, '99');
 
     expect(mockSessionRepo.create).not.toHaveBeenCalled();
+  });
+
+  // ==========================================================================
+  // 14b. ensureSessionInDatabase: records per-device row when sender deviceId differs
+  // ==========================================================================
+  it('ensureSessionInDatabase records the correct deviceId when provided', async () => {
+    mockSessionRepo.findByUserRoomAndDevice.mockResolvedValue(null);
+    mockSessionRepo.findByRoom.mockResolvedValue([]);
+
+    await sessionService.ensureSessionInDatabase(10, '99', 4);
+
+    expect(mockSessionRepo.findByUserRoomAndDevice).toHaveBeenCalledWith('99', 10, 4);
+    expect(mockSessionRepo.create).toHaveBeenCalledWith(
+      expect.objectContaining({
+        idUser: '99',
+        idRoom: 10,
+        remoteUserDeviceId: 4,
+      })
+    );
   });
 
   // ==========================================================================
@@ -596,6 +617,105 @@ describe('SessionService', () => {
     await sessionService.rotateSignedPreKeyIfNeeded(1);
 
     expect(SignalProtocol.rotateSignedPreKey).not.toHaveBeenCalled();
+  });
+
+  // ==========================================================================
+  // 25. Multi-device cache refresh (frontend-0008)
+  // ==========================================================================
+  describe('multi-device cache refresh', () => {
+    function multiDeviceResponse(deviceIds: number[] = [1, 2]) {
+      return {
+        devices: deviceIds.map((deviceId) => ({
+          registrationId: 1234 + deviceId,
+          identityKey: 'idKey==',
+          deviceId,
+          preKey: { keyId: 5, keyData: 'pk==', deviceId },
+          signedPreKey: { keyId: 1, keyData: 'spk==', signature: 'sig==' },
+          kyberPreKey: { keyId: 7, keyData: 'kpk==', signature: 'ksig==', deviceId },
+        })),
+      };
+    }
+
+    it('setSession with existing session refreshes deviceMap from /keys', async () => {
+      mockSessionRepo.findByUserAndRoom.mockResolvedValue(makeSession({ idUser: '99', idRoom: 10 }));
+      mockApi.getRemoteKeys.mockResolvedValue(multiDeviceResponse([1, 2, 3]));
+
+      const result = await sessionService.setSession(10, 99, 'alice');
+
+      // resume path was taken — no new session creation
+      expect(result).toBe(true);
+      expect(SignalProtocol.resumeSession).toHaveBeenCalledWith('99', 'alice', 1);
+      expect(SignalProtocol.setRemoteUserKeys).not.toHaveBeenCalled();
+      // But /keys/:userId was still fetched to refresh the device map.
+      // The refresh runs detached via .catch(), so flush microtasks first.
+      await new Promise((r) => setImmediate(r));
+      expect(mockApi.getRemoteKeys).toHaveBeenCalledWith('99');
+      expect(sessionService.getRemoteDeviceIds('99').sort()).toEqual([1, 2, 3]);
+    });
+
+    it('updateRemoteDeviceMap persists CSV via sessionRepository', async () => {
+      mockApi.getRemoteKeys.mockResolvedValue(multiDeviceResponse([1, 4, 7]));
+
+      await sessionService.refreshRemoteDeviceMap(10, '99', { force: true });
+
+      expect(mockSessionRepo.updateRemoteKnownDevicesForUser).toHaveBeenCalledWith(
+        '99',
+        [1, 4, 7],
+      );
+    });
+
+    it('refreshRemoteDeviceMap respects per-userId throttle', async () => {
+      mockApi.getRemoteKeys.mockResolvedValue(multiDeviceResponse([1, 2]));
+
+      await sessionService.refreshRemoteDeviceMap(10, '99');
+      await sessionService.refreshRemoteDeviceMap(10, '99'); // throttled
+      await sessionService.refreshRemoteDeviceMap(10, '99'); // throttled
+
+      expect(mockApi.getRemoteKeys).toHaveBeenCalledTimes(1);
+    });
+
+    it('refreshRemoteDeviceMap force:true bypasses throttle', async () => {
+      mockApi.getRemoteKeys.mockResolvedValue(multiDeviceResponse([1, 2]));
+
+      await sessionService.refreshRemoteDeviceMap(10, '99');
+      await sessionService.refreshRemoteDeviceMap(10, '99', { force: true });
+
+      expect(mockApi.getRemoteKeys).toHaveBeenCalledTimes(2);
+    });
+
+    it('invalidateRemoteDeviceMap drops cache and persists empty list', () => {
+      // Seed the cache via the private setter
+      (sessionService as any).deviceMap.set('99', new Set([1, 2, 3]));
+      expect(sessionService.getRemoteDeviceIds('99')).toEqual([1, 2, 3]);
+
+      sessionService.invalidateRemoteDeviceMap('99');
+
+      expect(sessionService.getRemoteDeviceIds('99')).toEqual([]);
+      expect(mockSessionRepo.updateRemoteKnownDevicesForUser).toHaveBeenCalledWith('99', []);
+    });
+
+    it('loadSessions rehydrates deviceMap from remote_known_devices column', async () => {
+      mockSessionRepo.findAll.mockResolvedValue([
+        makeSession({ idUser: '10', idRoom: 1, remoteKnownDevices: '1,2,5' }),
+        makeSession({ idUser: '10', idRoom: 2, remoteKnownDevices: '1,2,5' }),
+        makeSession({ idUser: '20', idRoom: 1, remoteKnownDevices: null }),
+      ]);
+
+      await sessionService.loadSessions();
+
+      expect(sessionService.getRemoteDeviceIds('10').sort()).toEqual([1, 2, 5]);
+      expect(sessionService.getRemoteDeviceIds('20')).toEqual([]);
+    });
+
+    it('loadSessions tolerates malformed CSV', async () => {
+      mockSessionRepo.findAll.mockResolvedValue([
+        makeSession({ idUser: '10', idRoom: 1, remoteKnownDevices: '1,,bogus,3' }),
+      ]);
+
+      await sessionService.loadSessions();
+
+      expect(sessionService.getRemoteDeviceIds('10').sort()).toEqual([1, 3]);
+    });
   });
 
   // ==========================================================================

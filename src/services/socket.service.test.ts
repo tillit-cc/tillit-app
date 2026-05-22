@@ -79,6 +79,10 @@ describe('SocketService', () => {
     // Fresh instance per test
     service = new SocketService(1, 'https://api.test.com', '/chat');
     service.setTokenGetter(tokenGetter);
+    // The "no token but authenticated" branch is gated by an explicit
+    // auth checker (no longer reads the store directly). Default to the
+    // mocked store so individual tests can override via mockReturnValueOnce.
+    service.setAuthChecker(() => useAuthStore.getState().isAuthenticated);
   });
 
   // ---------------------------------------------------------------
@@ -436,7 +440,7 @@ describe('SocketService', () => {
     };
 
     await expect(
-      service.sendMessage(1, envelope, 'user', 'text'),
+      service.sendMessage({ roomId: 1, message: envelope, category: 'user', type: 'text' }),
     ).rejects.toThrow('Socket not connected');
   });
 
@@ -487,7 +491,7 @@ describe('SocketService', () => {
       id_user_from: 2,
     };
 
-    const result = await service.sendMessage(5, envelope, 'user', 'text');
+    const result = await service.sendMessage({ roomId: 5, message: envelope, category: 'user', type: 'text' });
 
     expect(result).toEqual({ success: true, delivered: true });
     expect(mockSocket.emit).toHaveBeenCalledWith(
@@ -495,5 +499,398 @@ describe('SocketService', () => {
       expect.objectContaining({ roomId: 5, message: envelope, category: 'user', type: 'text' }),
       expect.any(Function),
     );
+  });
+
+  // ---------------------------------------------------------------
+  // 19. sendMessage fan-out: recipients[] travel top-level, not in message
+  // ---------------------------------------------------------------
+  it('sendMessage with recipients[] emits them top-level (never nested in message)', async () => {
+    await service.connect();
+    captureSocketListeners()['connect']();
+    mockSocket.connected = true;
+    mockSocket.emit.mockImplementation(
+      (_event: string, _payload: any, ackCb: (response: any) => void) => {
+        ackCb({ success: true, delivered: true, messageId: 'srv-1' });
+      },
+    );
+
+    const recipients = [
+      { userId: 1059, deviceId: 1, ciphertext: 'ct-android' },
+      { userId: 1067, deviceId: 1, ciphertext: 'ct-self-primary' },
+    ];
+
+    const result = await service.sendMessage({
+      roomId: 163,
+      recipients,
+      category: 'user',
+      type: 'text',
+    });
+
+    expect(result).toEqual({ success: true, delivered: true, messageId: 'srv-1' });
+
+    const emitted = mockSocket.emit.mock.calls[0][1];
+    expect(emitted.roomId).toBe(163);
+    expect(emitted.category).toBe('user');
+    expect(emitted.recipients).toEqual(recipients);
+    // The fan-out recipients MUST be top-level — the backend gateway only
+    // routes to fanOutToRecipients when `recipients` is top-level.
+    expect(emitted.message).toBeUndefined();
+  });
+
+  // ---------------------------------------------------------------
+  // 20. sendMessage fan-out: metadata + volatile carried top-level
+  // ---------------------------------------------------------------
+  it('sendMessage with recipients[] carries metadata and volatile top-level', async () => {
+    await service.connect();
+    captureSocketListeners()['connect']();
+    mockSocket.connected = true;
+    mockSocket.emit.mockImplementation(
+      (_event: string, _payload: any, ackCb: (response: any) => void) => {
+        ackCb({ success: true });
+      },
+    );
+
+    await service.sendMessage({
+      roomId: 7,
+      recipients: [{ userId: 2, deviceId: 1, ciphertext: 'ct' }],
+      metadata: { id_parent: 'parent-msg', version: '2.0' },
+      category: 'user',
+      type: 'text',
+      volatile: true,
+    });
+
+    const emitted = mockSocket.emit.mock.calls[0][1];
+    expect(emitted.metadata).toEqual({ id_parent: 'parent-msg', version: '2.0' });
+    expect(emitted.volatile).toBe(true);
+  });
+
+  // ---------------------------------------------------------------
+  // 21. sendMessage fan-out: empty metadata omitted from the wire
+  // ---------------------------------------------------------------
+  it('sendMessage with recipients[] omits metadata when it has no fields', async () => {
+    await service.connect();
+    captureSocketListeners()['connect']();
+    mockSocket.connected = true;
+    mockSocket.emit.mockImplementation(
+      (_event: string, _payload: any, ackCb: (response: any) => void) => {
+        ackCb({ success: true });
+      },
+    );
+
+    await service.sendMessage({
+      roomId: 7,
+      recipients: [{ userId: 2, deviceId: 1, ciphertext: 'ct' }],
+      metadata: {},
+      category: 'user',
+      type: 'text',
+    });
+
+    const emitted = mockSocket.emit.mock.calls[0][1];
+    expect(emitted.metadata).toBeUndefined();
+    expect('volatile' in emitted).toBe(false);
+  });
+
+  // ---------------------------------------------------------------
+  // 22. sendMessage legacy: message envelope, no recipients
+  // ---------------------------------------------------------------
+  it('sendMessage legacy path emits a message envelope and no recipients', async () => {
+    await service.connect();
+    captureSocketListeners()['connect']();
+    mockSocket.connected = true;
+    mockSocket.emit.mockImplementation(
+      (_event: string, _payload: any, ackCb: (response: any) => void) => {
+        ackCb({ success: true });
+      },
+    );
+
+    const envelope = {
+      id: 'sk-1',
+      timestamp: Date.now(),
+      category: 'senderkey_message',
+      type: 'text',
+      payload: { ciphertext: 'sk-ct', distributionId: 'd1' },
+      id_room: 9,
+      id_user_from: 3,
+    };
+
+    await service.sendMessage({
+      roomId: 9,
+      message: envelope,
+      category: 'senderkey_message',
+      type: 'text',
+    });
+
+    const emitted = mockSocket.emit.mock.calls[0][1];
+    expect(emitted.message).toEqual(envelope);
+    expect(emitted.recipients).toBeUndefined();
+  });
+
+  // ---------------------------------------------------------------
+  // 23. sendMessage fan-out: client envelope id forwarded as top-level `id`
+  //     (frontend-0017 — aligns backend baseId with the local envelopeId)
+  // ---------------------------------------------------------------
+  it('sendMessage with recipients[] forwards `id` top-level when provided', async () => {
+    await service.connect();
+    captureSocketListeners()['connect']();
+    mockSocket.connected = true;
+    mockSocket.emit.mockImplementation(
+      (_event: string, _payload: any, ackCb: (response: any) => void) => {
+        ackCb({ success: true });
+      },
+    );
+
+    await service.sendMessage({
+      roomId: 7,
+      id: 'env-abc-123',
+      recipients: [{ userId: 2, deviceId: 1, ciphertext: 'ct' }],
+      category: 'user',
+      type: 'text',
+    });
+
+    const emitted = mockSocket.emit.mock.calls[0][1];
+    expect(emitted.id).toBe('env-abc-123');
+    expect(emitted.recipients).toBeDefined();
+  });
+
+  // ---------------------------------------------------------------
+  // 24. extractEnvelope lifts senderDeviceId from wrapper onto an as-is
+  //     candidate envelope (frontend-0018 — newPacket multi-device peer).
+  // ---------------------------------------------------------------
+  it('extractEnvelope lifts senderDeviceId from wrapper into envelope.device_id_from', async () => {
+    const handler = jest.fn();
+    service.onPacket(handler);
+
+    await service.connect();
+    const listeners = captureSocketListeners();
+
+    // Desktop-style control packet: candidate has full snake_case envelope but
+    // no device_id_from; senderDeviceId is on the outer wrapper.
+    const candidate = {
+      id: 'ctrl-1',
+      timestamp: Date.now(),
+      category: 'control' as const,
+      type: 'READ',
+      payload: { id_message: 'm1' },
+      id_room: 42,
+      id_user_from: 1067,
+    };
+    const data = {
+      senderDeviceId: 4,
+      packet: candidate,
+    };
+
+    listeners[CHAT_EVENTS.NewPacket](data);
+
+    expect(handler).toHaveBeenCalledTimes(1);
+    const received = handler.mock.calls[0][0] as MessageEnvelope;
+    expect(received.device_id_from).toBe(4);
+    expect(received.id_user_from).toBe(1067);
+  });
+
+  // ---------------------------------------------------------------
+  // 25. extractEnvelope lifts idParent (camelCase) from wrapper onto an
+  //     as-is candidate envelope (frontend-0014 — reply threading after
+  //     server-side fan-out envelope reconstruction).
+  // ---------------------------------------------------------------
+  it('extractEnvelope lifts idParent (camelCase) into envelope.id_parent', async () => {
+    const handler = jest.fn();
+    service.onMessage(handler);
+
+    await service.connect();
+    const listeners = captureSocketListeners();
+
+    const candidate = {
+      id: 'msg-2',
+      timestamp: Date.now(),
+      category: 'user' as const,
+      type: 'text',
+      payload: { encrypted: 'ct' },
+      id_room: 42,
+      id_user_from: 7,
+    };
+    // Backend wraps the fan-out envelope with camelCase wrapper-level fields.
+    const data = {
+      idParent: 'parent-msg-1',
+      message: candidate,
+    };
+
+    listeners[CHAT_EVENTS.NewMessage](data);
+
+    expect(handler).toHaveBeenCalledTimes(1);
+    const received = handler.mock.calls[0][0] as MessageEnvelope;
+    expect(received.id_parent).toBe('parent-msg-1');
+  });
+
+  // ---------------------------------------------------------------
+  // 27. sendPacket fan-out: recipients[] travel top-level (never nested in
+  //     packet). The backend gateway only routes to fanOutPacketToRecipients
+  //     when `recipients` is top-level — nesting drops the receipt onto the
+  //     legacy single-broadcast path (frontend-0019).
+  // ---------------------------------------------------------------
+  it('sendPacket with recipients[] emits them top-level (never nested in packet)', async () => {
+    await service.connect();
+    captureSocketListeners()['connect']();
+    mockSocket.connected = true;
+    mockSocket.emit.mockImplementation(
+      (_event: string, _payload: any, ackCb: (response: any) => void) => {
+        ackCb({ success: true, delivered: true, packetId: 'srv-pkt-1', timestamp: 't' });
+      },
+    );
+
+    const recipients = [
+      {
+        userId: 1067,
+        deviceId: 1,
+        packet: {
+          id: 'pkt-1',
+          timestamp: 1,
+          category: 'control',
+          type: 'read',
+          payload: { ciphertext: 'ct-primary' },
+          id_room: 163,
+          id_user_from: 1059,
+          id_user_to: 1067,
+          encrypted: true,
+          version: '2.0',
+        },
+      },
+      {
+        userId: 1067,
+        deviceId: 4,
+        packet: {
+          id: 'pkt-1',
+          timestamp: 1,
+          category: 'control',
+          type: 'read',
+          payload: { ciphertext: 'ct-desktop' },
+          id_room: 163,
+          id_user_from: 1059,
+          id_user_to: 1067,
+          encrypted: true,
+          version: '2.0',
+        },
+      },
+    ];
+
+    const result = await service.sendPacket({ roomId: 163, recipients });
+
+    expect(result).toEqual({ success: true, delivered: true, packetId: 'srv-pkt-1', timestamp: 't' });
+
+    const emitted = mockSocket.emit.mock.calls[0][1];
+    expect(emitted.roomId).toBe(163);
+    expect(emitted.recipients).toEqual(recipients);
+    // The fan-out recipients MUST be top-level. The backend gateway only
+    // routes to fanOutPacketToRecipients when `recipients` is top-level;
+    // a nested `packet.payload.recipients` falls onto the legacy broadcast
+    // path that filters by userId only.
+    expect(emitted.packet).toBeUndefined();
+    expect(emitted.recipientIds).toBeUndefined();
+  });
+
+  // ---------------------------------------------------------------
+  // 28. sendPacket fan-out: volatile carried top-level (typing).
+  // ---------------------------------------------------------------
+  it('sendPacket with recipients[] carries volatile top-level', async () => {
+    await service.connect();
+    captureSocketListeners()['connect']();
+    mockSocket.connected = true;
+    mockSocket.emit.mockImplementation(
+      (_event: string, _payload: any, ackCb: (response: any) => void) => {
+        ackCb({ success: true });
+      },
+    );
+
+    await service.sendPacket({
+      roomId: 7,
+      recipients: [
+        {
+          userId: 2,
+          deviceId: 1,
+          packet: {
+            id: 'pkt-typ',
+            timestamp: 1,
+            category: 'control',
+            type: 'typing_started',
+            payload: { ciphertext: 'ct' },
+            id_room: 7,
+            id_user_from: 1,
+            encrypted: true,
+            version: '2.0',
+          },
+        },
+      ],
+      volatile: true,
+    });
+
+    const emitted = mockSocket.emit.mock.calls[0][1];
+    expect(emitted.volatile).toBe(true);
+  });
+
+  // ---------------------------------------------------------------
+  // 29. sendPacket legacy: positional args → single envelope wire shape.
+  //     Kept for the sender-key control-packet path (group-wide ciphertext).
+  // ---------------------------------------------------------------
+  it('sendPacket legacy positional path emits packet + recipientIds (no top-level recipients)', async () => {
+    await service.connect();
+    captureSocketListeners()['connect']();
+    mockSocket.connected = true;
+    mockSocket.emit.mockImplementation(
+      (_event: string, _payload: any, ackCb: (response: any) => void) => {
+        ackCb({ success: true });
+      },
+    );
+
+    const envelope: MessageEnvelope = {
+      id: 'sk-pkt-1',
+      timestamp: Date.now(),
+      category: 'control',
+      type: 'read',
+      payload: { ciphertext: 'sk-ct', distributionId: 'd1' },
+      id_room: 9,
+      id_user_from: 3,
+    };
+
+    await service.sendPacket(9, envelope, [4], true);
+
+    const emitted = mockSocket.emit.mock.calls[0][1];
+    expect(emitted.roomId).toBe(9);
+    expect(emitted.packet).toEqual(envelope);
+    expect(emitted.recipientIds).toEqual([4]);
+    expect(emitted.volatile).toBe(true);
+    expect(emitted.recipients).toBeUndefined();
+  });
+
+  // ---------------------------------------------------------------
+  // 30. extractEnvelope wrapper path reads idParent (camelCase) from
+  //     wrapper when the inner payload doesn't carry it (frontend-0014).
+  // ---------------------------------------------------------------
+  it('extractEnvelope wrapper path reads idParent (camelCase) from wrapper', async () => {
+    const handler = jest.fn();
+    service.onMessage(handler);
+
+    await service.connect();
+    const listeners = captureSocketListeners();
+
+    // Backend fan-out wire: envelope is the top-level data with camelCase
+    // `idParent`/`roomId`/`senderId`/`senderDeviceId`. The inner `message`
+    // is the ciphertext, not an envelope.
+    const data = {
+      id: 'msg-3',
+      roomId: 99,
+      senderId: 15,
+      senderDeviceId: 2,
+      category: 'user',
+      type: 'text',
+      idParent: 'parent-msg-2',
+      timestamp: '2024-01-01T00:00:00Z',
+      message: { encrypted: 'ct' },
+    };
+
+    listeners[CHAT_EVENTS.NewMessage](data);
+
+    expect(handler).toHaveBeenCalledTimes(1);
+    const received = handler.mock.calls[0][0] as MessageEnvelope;
+    expect(received.id_parent).toBe('parent-msg-2');
+    expect(received.device_id_from).toBe(2);
   });
 });

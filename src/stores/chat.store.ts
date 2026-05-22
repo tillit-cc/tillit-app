@@ -142,6 +142,7 @@ interface ChatState {
   getCurrentRoom: () => RoomWithMetadata | null;
   getSortedRooms: () => RoomWithMetadata[];
   getMessageMetadata: () => Map<string, MessageMetadata>;
+  findMessageInRoom: (roomId: number, messageId: string) => Message | undefined;
 }
 
 export const useChatStore = create<ChatState>()(
@@ -484,6 +485,15 @@ export const useChatStore = create<ChatState>()(
       }
 
       return computeMessageMetadata(messages, profiles, currentUserId, memberCount, dateCache);
+    },
+
+    findMessageInRoom: (roomId, messageId) => {
+      const pending = pendingAddMessages.get(roomId);
+      if (pending) {
+        const found = pending.find((m) => m.id === messageId);
+        if (found) return found;
+      }
+      return get().messages.get(roomId)?.find((m) => m.id === messageId);
     },
   }))
 );

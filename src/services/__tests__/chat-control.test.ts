@@ -30,6 +30,7 @@ jest.mock('@/db/repositories/message.repository', () => ({
     delete: jest.fn(),
     markAsRead: jest.fn(),
     findByRoomAndType: jest.fn().mockResolvedValue([]),
+    countUnreadIncoming: jest.fn().mockResolvedValue(0),
   },
 }));
 jest.mock('@/db/repositories/room.repository', () => ({
@@ -52,6 +53,7 @@ jest.mock('@/db/repositories/profile.repository', () => ({
   profileRepository: {
     upsert: jest.fn(),
     findByRoom: jest.fn().mockResolvedValue([]),
+    findByUserAndRoom: jest.fn().mockResolvedValue(null),
   },
 }));
 
@@ -84,6 +86,8 @@ jest.mock('../session.service', () => ({
     deleteSessionsByRoom: jest.fn().mockResolvedValue(undefined),
     loadSessions: jest.fn().mockResolvedValue([]),
     initializePreKeyTracking: jest.fn().mockResolvedValue(undefined),
+    getRemoteDeviceIds: jest.fn(() => [] as number[]),
+    fetchAllRemoteBundles: jest.fn().mockResolvedValue([]),
   },
 }));
 
@@ -113,12 +117,16 @@ jest.mock('../media-crypto.service', () => ({
   mediaCryptoService: { encrypt: jest.fn(), decrypt: jest.fn() },
 }));
 
-const mockChatStore = { currentRoomId: null as number | null, messages: new Map(), allRooms: [] as any[], addMessage: jest.fn(), updateMessage: jest.fn(), removeMessage: jest.fn(), setMessages: jest.fn(), prependMessages: jest.fn(), replaceMessageId: jest.fn(), addRoomToList: jest.fn(), updateRoomInList: jest.fn(), removeRoomFromList: jest.fn(), clearRoom: jest.fn(), clearAll: jest.fn(), setAllRooms: jest.fn(), setProfiles: jest.fn(), updateProfile: jest.fn(), setTyping: jest.fn(), setPaginationState: jest.fn() };
+const mockChatStore: any = { currentRoomId: null as number | null, messages: new Map(), allRooms: [] as any[], addMessage: jest.fn(), updateMessage: jest.fn(), removeMessage: jest.fn(), setMessages: jest.fn(), prependMessages: jest.fn(), replaceMessageId: jest.fn(), addRoomToList: jest.fn(), updateRoomInList: jest.fn(), removeRoomFromList: jest.fn(), clearRoom: jest.fn(), clearAll: jest.fn(), setAllRooms: jest.fn(), setProfiles: jest.fn(), updateProfile: jest.fn(), setTyping: jest.fn(), setPaginationState: jest.fn() };
+mockChatStore.findMessageInRoom = jest.fn((roomId: number, messageId: string) => ((mockChatStore.messages.get(roomId) || []) as any[]).find((m) => m.id === messageId));
 jest.mock('@/stores/chat.store', () => ({ useChatStore: { getState: jest.fn(() => mockChatStore) } }));
 jest.mock('@/stores/auth.store', () => ({ useAuthStore: { getState: jest.fn(() => ({ isAuthenticated: true, userId: 42 })) } }));
 jest.mock('@/stores/server.store', () => ({ useServerStore: { getState: jest.fn(() => ({ setConnectionState: jest.fn() })) } }));
 jest.mock('@/utils/logger', () => ({ logger: { info: jest.fn(), warn: jest.fn(), error: jest.fn() } }));
 jest.mock('@/utils/image', () => ({ generateThumbnailFromBase64: jest.fn(), saveImageToFile: jest.fn().mockResolvedValue('/path/to/image.jpg'), deleteImagesByMessageIds: jest.fn(), readImageAsBase64: jest.fn() }));
+
+const mockSetBadgeCountAsync = jest.fn().mockResolvedValue(undefined);
+jest.mock('expo-notifications', () => ({ setBadgeCountAsync: (...args: any[]) => mockSetBadgeCountAsync(...args) }));
 
 import { chatService } from '../chat.service';
 import { senderKeyService } from '../sender-key.service';
@@ -184,9 +192,10 @@ describe('ChatService — processControlPacket', () => {
   });
 
   it('MESSAGE_READ: updates message status if current < READ', async () => {
-    // Message at DELIVERED (3) — should upgrade to READ (4)
+    // Peer-read path: peer (99) marks our outgoing (idUserFrom=42, ie self) at
+    // DELIVERED (3) as READ (4).
     const roomMessages = [
-      { id: 'msg-1', idStatus: MessageStatus.DELIVERED },
+      { id: 'msg-1', idStatus: MessageStatus.DELIVERED, idUserFrom: 42, read: null },
     ];
     mockChatStore.messages.set(100, roomMessages);
 
@@ -203,6 +212,108 @@ describe('ChatService — processControlPacket', () => {
       'msg-1',
       { idStatus: MessageStatus.READ }
     );
+    // Peer-read does NOT stamp `read` (timestamp) — only idStatus
+    expect(mockMessageRepo.markAsRead).not.toHaveBeenCalled();
+  });
+
+  it('MESSAGE_READ self-fanout: stamps `read` on incoming + recomputes unread + refreshes badge', async () => {
+    // Self (userId 42) reads on another device → MESSAGE_READ with
+    // id_user_from === 42 arrives here. Target is an incoming message
+    // (idUserFrom=99) at DELIVERED, not yet read locally.
+    const roomMessages = [
+      { id: 'msg-1', idStatus: MessageStatus.DELIVERED, idUserFrom: 99, read: null },
+    ];
+    mockChatStore.messages.set(100, roomMessages);
+    mockChatStore.allRooms = [
+      { id: 100, unreadCount: 3 } as any,
+      { id: 200, unreadCount: 5 } as any,
+    ];
+    (mockMessageRepo.countUnreadIncoming as jest.Mock).mockResolvedValue(2);
+
+    await (chatService as any).processControlPacket(
+      ControlPacketType.MESSAGE_READ,
+      { id_messages: ['msg-1'] },
+      100,
+      42 // self-fanout: id_user_from === self
+    );
+
+    expect(mockMessageRepo.markAsRead).toHaveBeenCalledWith('msg-1');
+    expect(mockChatStore.updateMessage).toHaveBeenCalledWith(
+      100,
+      'msg-1',
+      expect.objectContaining({ idStatus: MessageStatus.READ }),
+    );
+    // Peer-read path NOT used → updateStatus untouched
+    expect(mockMessageRepo.updateStatus).not.toHaveBeenCalled();
+    // Unread recomputed
+    expect(mockMessageRepo.countUnreadIncoming).toHaveBeenCalledWith(100, expect.arrayContaining([42]));
+    expect(mockChatStore.updateRoomInList).toHaveBeenCalledWith(100, { unreadCount: 2 });
+    // Badge refreshed — sum of unreadCount across rooms (which we updated
+    // for room 100 above; mockChatStore.allRooms still has the stale 3,
+    // because the mock updateRoomInList doesn't mutate the array — we
+    // just assert setBadgeCountAsync got called at all).
+    expect(mockSetBadgeCountAsync).toHaveBeenCalled();
+  });
+
+  it('MESSAGE_READ self-fanout: no-op on outgoing target (defensive fallback to peer-read branch)', async () => {
+    // Envelope claims self-fanout (id_user_from === self) but the target
+    // is our own outgoing message — falls through to peer-read branch,
+    // which advances idStatus.
+    const roomMessages = [
+      { id: 'msg-1', idStatus: MessageStatus.DELIVERED, idUserFrom: 42, read: null },
+    ];
+    mockChatStore.messages.set(100, roomMessages);
+
+    await (chatService as any).processControlPacket(
+      ControlPacketType.MESSAGE_READ,
+      { id_message: 'msg-1' },
+      100,
+      42
+    );
+
+    // Self-fanout path skipped (target is outgoing), peer-read path runs
+    expect(mockMessageRepo.markAsRead).not.toHaveBeenCalled();
+    expect(mockMessageRepo.updateStatus).toHaveBeenCalledWith('msg-1', MessageStatus.READ);
+  });
+
+  it('MESSAGE_READ self-fanout: idempotent — re-apply on already-read row does nothing', async () => {
+    const roomMessages = [
+      { id: 'msg-1', idStatus: MessageStatus.READ, idUserFrom: 99, read: 1234567890 },
+    ];
+    mockChatStore.messages.set(100, roomMessages);
+    mockChatStore.allRooms = [{ id: 100, unreadCount: 0 } as any];
+    (mockMessageRepo.countUnreadIncoming as jest.Mock).mockResolvedValue(0);
+
+    await (chatService as any).processControlPacket(
+      ControlPacketType.MESSAGE_READ,
+      { id_messages: ['msg-1'] },
+      100,
+      42
+    );
+
+    expect(mockMessageRepo.markAsRead).not.toHaveBeenCalled();
+    expect(mockMessageRepo.updateStatus).not.toHaveBeenCalled();
+    expect(mockChatStore.updateMessage).not.toHaveBeenCalled();
+    // No incoming was applied → no recompute / no badge refresh
+    expect(mockMessageRepo.countUnreadIncoming).not.toHaveBeenCalled();
+    expect(mockSetBadgeCountAsync).not.toHaveBeenCalled();
+  });
+
+  it('MESSAGE_DELIVERED self-fanout: skipped entirely (no idStatus advance)', async () => {
+    const roomMessages = [
+      { id: 'msg-1', idStatus: MessageStatus.SENT, idUserFrom: 42, read: null },
+    ];
+    mockChatStore.messages.set(100, roomMessages);
+
+    await (chatService as any).processControlPacket(
+      ControlPacketType.MESSAGE_DELIVERED,
+      { id_message: 'msg-1' },
+      100,
+      42
+    );
+
+    expect(mockMessageRepo.updateStatus).not.toHaveBeenCalled();
+    expect(mockChatStore.updateMessage).not.toHaveBeenCalled();
   });
 
   it('SESSION_ESTABLISHED: updates room hasSession, redistributes sender keys', async () => {

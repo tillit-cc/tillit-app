@@ -1,6 +1,17 @@
 import axios, { AxiosInstance, AxiosRequestConfig, AxiosResponse } from 'axios';
 import * as SecureStore from 'expo-secure-store';
 import { torAxiosAdapter } from './tor-axios-adapter';
+import type {
+  LinkInitRequest,
+  LinkInitResponse,
+  LinkSharePubkeyRequest,
+  LinkSharePubkeyResponse,
+  LinkCompleteRequest,
+  LinkCompleteResponse,
+  LinkSessionResultResponse,
+  DeviceListResponse,
+  DeviceRevokeResponse,
+} from '@/types/device';
 
 /**
  * Token storage key per server: `token_server_{serverId}`
@@ -210,7 +221,7 @@ export class ApiService {
   async uploadSenderKeyDistribution(
     roomId: number,
     distributionId: string,
-    distributions: Array<{ recipientUserId: number; encryptedSenderKey: string }>
+    distributions: Array<{ recipientUserId: number; recipientDeviceId: number; encryptedSenderKey: string }>
   ): Promise<void> {
     return this.post(`sender-keys/distribute/${roomId}`, {
       distributionId,
@@ -264,6 +275,54 @@ export class ApiService {
     description?: string;
   }): Promise<{ success: boolean; reportId: number }> {
     return this.post('/moderation/report', data);
+  }
+
+  // Multi-device linking endpoints — see _shared/api/multi-device-linking.md (v2 + v2.1 proposed).
+  // Backend wire v2 tracked in _shared/tasks/backend-0006-pairing-flip.md.
+  // Backend wire v2.1 (share-pubkey) tracked in _shared/tasks/backend-0008-symmetric-safety-number.md.
+
+  /** New device side. Anonymous. Open a new pairing session with the device's ephemeral pub. */
+  async linkInit(payload: LinkInitRequest): Promise<LinkInitResponse> {
+    return this.post('/auth/devices/link/init', payload);
+  }
+
+  /**
+   * Primary side (wire v2.1). Deposits `P_pub` on the session so the new
+   * device can compute its SN before the primary commits with /complete.
+   * Idempotent: re-call with the same `primaryEphemeralPublicKey` is a
+   * no-op; a different value yields 409 `PUBKEY_MISMATCH`.
+   */
+  async linkSharePubkey(payload: LinkSharePubkeyRequest): Promise<LinkSharePubkeyResponse> {
+    return this.post('/auth/devices/link/share-pubkey', payload);
+  }
+
+  /**
+   * Primary side. Deposit the encrypted provisioning payload. Requires
+   * the session to be in `pubkey-shared` state (i.e. /share-pubkey must
+   * have run first in wire v2.1).
+   */
+  async linkComplete(payload: LinkCompleteRequest): Promise<LinkCompleteResponse> {
+    return this.post('/auth/devices/link/complete', payload);
+  }
+
+  /** New device side. Anonymous (sessionId-authorized). One-time-use: marks the session consumed. */
+  async linkSessionResult(sessionId: string): Promise<LinkSessionResultResponse> {
+    return this.get(`/auth/devices/link/session/${encodeURIComponent(sessionId)}/result`);
+  }
+
+  /** Primary side. Lists devices belonging to the authenticated user. */
+  async listDevices(): Promise<DeviceListResponse> {
+    return this.get('/auth/devices');
+  }
+
+  /** Primary side. Revoke a linked device (cannot revoke the primary itself). */
+  async revokeDevice(deviceId: number): Promise<DeviceRevokeResponse> {
+    return this.delete(`/auth/devices/${deviceId}`);
+  }
+
+  /** Either side. Self-revoke the current device (logout + cleanup). */
+  async revokeMyDevice(): Promise<DeviceRevokeResponse> {
+    return this.delete('/auth/devices/me');
   }
 
   // Auth status check (no JWT guard on server)

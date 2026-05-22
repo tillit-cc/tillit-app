@@ -2,7 +2,44 @@
 
 jest.mock('react-native', () => ({
   AppState: { addEventListener: jest.fn(() => ({ remove: jest.fn() })) },
-  Platform: { OS: 'ios' },
+  Platform: { OS: 'ios', select: (obj: any) => obj.ios ?? obj.default },
+  Appearance: {
+    getColorScheme: jest.fn(() => 'light'),
+    addChangeListener: jest.fn(() => ({ remove: jest.fn() })),
+    // react-native-css-interop probes this during module init.
+    isReduceMotionEnabled: jest.fn(() => false),
+    addReduceMotionChangeListener: jest.fn(() => ({ remove: jest.fn() })),
+  },
+  NativeModules: {},
+  NativeEventEmitter: jest.fn().mockImplementation(() => ({
+    addListener: jest.fn(),
+    removeAllListeners: jest.fn(),
+  })),
+  StyleSheet: { create: (obj: any) => obj, flatten: (s: any) => s },
+}));
+
+jest.mock('expo-localization', () => ({
+  getLocales: jest.fn(() => [{ languageCode: 'en', languageTag: 'en-US' }]),
+  getCalendars: jest.fn(() => []),
+}));
+
+// db/client and the repositories pull in expo-sqlite → expo-modules-core →
+// react-native-css-interop, which probes Appearance.isReduceMotionEnabled at
+// import time. Bypassing the chain by stubbing the repos at module level
+// matches the pattern used in src/services/__tests__/chat-*.test.ts.
+jest.mock('@/db/client', () => ({
+  getDatabase: jest.fn(() => ({})),
+  initDatabase: jest.fn().mockResolvedValue(undefined),
+  wipeDatabaseFiles: jest.fn().mockResolvedValue(undefined),
+}));
+
+jest.mock('@/db/repositories/message.repository', () => ({
+  messageRepository: {
+    findStuckSending: jest.fn().mockResolvedValue([]),
+    findById: jest.fn().mockResolvedValue(null),
+    updateStatus: jest.fn().mockResolvedValue(undefined),
+    deleteAll: jest.fn().mockResolvedValue(undefined),
+  },
 }));
 
 jest.mock('signal-protocol', () => ({
@@ -27,6 +64,7 @@ const mockApi = {
 
 jest.mock('./server-registry', () => ({
   serverRegistry: {
+    setAuthCallbacks: jest.fn(),
     loadServers: jest.fn().mockResolvedValue(undefined),
     ensureDefaultServer: jest.fn().mockResolvedValue(undefined),
     connectAll: jest.fn().mockResolvedValue(undefined),
@@ -38,6 +76,7 @@ jest.mock('./server-registry', () => ({
     getDefaultServerId: jest.fn(() => 1),
     onServerAdded: jest.fn(() => jest.fn()),
     reconnectServer: jest.fn().mockResolvedValue(undefined),
+    hasAnyTorServer: jest.fn(() => false),
   },
 }));
 
@@ -96,7 +135,13 @@ jest.mock('@/stores/chat.store', () => ({
 }));
 
 jest.mock('@/stores/server.store', () => ({
-  useServerStore: { getState: jest.fn(() => ({ setConnectionState: jest.fn() })) },
+  useServerStore: {
+    getState: jest.fn(() => ({
+      setConnectionState: jest.fn(),
+      isBanned: jest.fn(() => false),
+      setBanned: jest.fn(),
+    })),
+  },
 }));
 
 jest.mock('@/utils/logger', () => ({
