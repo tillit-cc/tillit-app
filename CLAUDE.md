@@ -167,6 +167,144 @@ B (joiner)                              A (membro esistente)
 
 **Nessuna race condition** grazie al `messageQueue`: sia `SESSION_ESTABLISHED`, `user_joined` che i messaggi dell'utente passano per `processEnvelope`, serializzati nella stessa coda.
 
+### Multi-device pairing (wire v2.1)
+
+L'app supporta multi-device: un utente può collegare fino a 5 device attivi (1 primary + 4 linked) condividendo la stessa identity Signal. Wire protocol v2.1 — direzione **new device mostra QR, primary scansiona** (ADR-0003) con **safety number simmetrico pre-commit** (ADR-0004). La spec wire è in `_shared/api/multi-device-linking.md`.
+
+**Cosa cambia rispetto alla v2:** lo smoke fisico del 2026-05-20 ha mostrato che nella v2 il telefono chiedeva di confrontare la SN prima che il desktop avesse `P_pub` per calcolare la propria — il SN era nominalmente confrontabile ma di fatto inverificabile (chicken-and-egg). La v2.1 inserisce un endpoint intermedio `POST /link/share-pubkey` (primary JWT) che pubblica `P_pub` lato session SENZA committare l'identity transfer, in modo che il new device possa calcolare e mostrare la SN PRIMA di /complete. Il SN torna a essere gate pre-commit invece di rollback-based.
+
+**Sequenza:**
+
+```
+NEW DEVICE                                PRIMARY
+─────────                                 ─────────
+1. genera (E_pub, E_priv) X25519
+2. POST /auth/devices/link/init (anon)
+   { ephemeralPublicKey: E_pub, deviceName? }
+   ← { sessionId, expiresAt }
+3. mostra QR(tillit://link?v=2&i=<sessionId>&s=<server>&e=<E_pub>)
+                                          4. scansiona QR (camera nativa)
+                                          5. verifica serverOrigin == proprio
+                                          6. genera (P_pub, P_priv)
+                                          7. computa safetyNumber(E_pub, P_pub,
+                                                                   identityPub,
+                                                                   primaryUserId)
+                                          8. POST /link/share-pubkey (JWT primary)
+                                             { sessionId, primaryEphemeralPublicKey: P_pub }
+                                             ← { ok: true }
+                                             // session.status → pubkey-shared
+                                          9. mostra SN sul telefono → tap Match
+10. GET /link/session/:sessionId/result
+    (polling 2s) → { status: 'pubkey-shared',
+                     primaryEphemeralPublicKey: P_pub,
+                     primaryUserId, identityKeyPub }
+11. computa safetyNumber con gli stessi 4 input
+    mostra SN sul new device → tap Match
+                                          12. user tap Match → POST /link/complete
+                                              { sessionId, encryptedPayload }   ← NO P_pub
+                                              ← { assignedDeviceId }
+                                              // session.status → completed
+13. GET /result continua → riceve
+    { status: 'completed', encryptedPayload, ... }
+14. peekProvisioningPayload (decrypt + integrity check)
+15. **anti-tamper check**: identityKeyPub dal payload
+    MUST == identityKeyPub ricevuto in pubkey-shared
+    mismatch → abort IDENTITY_KEY_TAMPERED
+16. consumeProvisioningPayload (Keychain install)
+17. challenge-response → primo JWT del new device
+18. POST /keys/ → backend emette deviceLinked al primary
+```
+
+**Garanzie chiave (ADR-0003 + ADR-0004):**
+
+- `E_pub` viaggia **in-band nel QR**, non via server → MITM via key-substitution lato server è impossibile (il primary legge E_pub direttamente dallo schermo del new device).
+- `P_pub` viaggia via server (in /share-pubkey poi /result); il **safety number simmetrico** in pubkey-shared lo copre — se il server lo sostituisce, le due SN divergono e l'utente rifiuta prima di /complete.
+- `identityKeyPub` viene servito dal server al new device in pubkey-shared (lookup del bundle pubblico del primary) E arriva di nuovo dentro l'encryptedPayload al completed: l'**anti-tamper check** lato client confronta i due e abort se differiscono.
+- Safety number 60 cifre confrontate out-of-band su entrambi i device, **pre-commit** — il commit (POST /complete) avviene solo dopo che entrambi hanno tappato Match.
+- Identity privata non lascia mai il Keychain nativo (path Option B: `encryptProvisioningPayload` legge dal Keychain, `consumeProvisioningPayload` scrive nel Keychain, JS vede solo ciphertext / bundle pubblico).
+- One-time-use lato server: `GET /link/session/:id/result` con `status=completed` marca `consumed_at` e droppa `encryptedPayload` + `primaryEphemeralPub` dalla riga.
+
+**Edge case di tempistica:** l'utente del new device può tappare Match prima che il primary chiami /complete (la SN è già visibile al pubkey-shared). In quel caso `confirmNewDeviceSafetyAndInstall` registra un waiter su `payloadArrivalResolvers` e si sblocca quando `onCompletedReady` riceve il payload dal poll. UI: durante l'attesa i bottoni Match/Mismatch lasciano il posto a un piccolo spinner ("In attesa di conferma dal dispositivo principale…").
+
+**Componenti app:**
+
+| File | Ruolo |
+|---|---|
+| `app/link-device.tsx` | **Primary side**: camera scanner, validazione serverOrigin, safety number, complete |
+| `app/claim-device.tsx` | **New device side**: linkInit, QR + countdown, polling result, peek, safety number, install |
+| `src/services/device.service.ts` | Orchestratore: `parseProvisioningLink` (parser v=2 strict), `handlePrimaryScannedQR` (include /share-pubkey), `confirmPrimarySafetyAndComplete` (body senza P_pub), `startNewDeviceLink`, `pollNewDeviceSessionResult` (branch su `pubkey-shared` / `completed`), `onPubkeyShared`, `onCompletedReady` (anti-tamper), `confirmNewDeviceSafetyAndInstall` (attende il payload via `payloadArrivalResolvers` se necessario), `loadDevices`, `revokeDevice` |
+| `src/stores/device.store.ts` | Phase machines invariati: `pairingPrimary` (`idle → scanning → safetyCheck → completing → done\|error`) e `pairingNewDevice` (`idle → init → waiting → polling → safetyCheck → installing → done\|error`). Stato esteso: `identityKeyPubFromShare` (anti-tamper), `safetyConfirmed` (utente ha tappato Match anche se payload non ancora arrivato). |
+| `src/types/device.ts` | Types wire v2.1 (`LinkSharePubkeyRequest/Response`, `LinkCompleteRequest` senza `primaryEphemeralPublicKey`, `LinkSessionResultResponse` con stato `pubkey-shared` + `primaryUserId` + `identityKeyPub`) |
+| `app/+native-intent.ts` | Deep link `tillit://link?v=2&i=...` → parking in `app.store.pendingPrimaryScanLink` → redirect a `/link-device` (primary scanner) |
+
+**Wire URL (QR):**
+
+```
+tillit://link?v=2&i=<sessionId>&s=<base64url(server_origin)>&e=<base64url(E_pub)>
+```
+
+Tutti i campi obbligatori. Mismatch `serverOrigin` lato primary → abort con `SERVER_MISMATCH`, nessuna chiamata `/complete`.
+
+**Endpoints backend (v2):**
+
+| Metodo | Path | Auth | Lato |
+|---|---|---|---|
+| POST | `/auth/devices/link/init` | anonimo | new device |
+| POST | `/auth/devices/link/share-pubkey` | primary JWT | primary |
+| POST | `/auth/devices/link/complete` | primary JWT | primary |
+| GET | `/auth/devices/link/session/:sessionId/result` | anonimo (sessionId bearer) | new device |
+| GET | `/auth/devices` | primary JWT | primary |
+| DELETE | `/auth/devices/:id` | primary JWT | primary |
+| DELETE | `/auth/devices/me` | qualsiasi | rollback |
+
+Tutto in `api.service.ts`: `linkInit`, `linkSharePubkey`, `linkComplete`, `linkSessionResult`, `listDevices`, `revokeDevice`, `revokeMyDevice`.
+
+**Server origin (Q2 dell'ADR-0003):** il new device usa `serverRegistry.getDefaultServer().apiUrl` (default `https://api.tillit.cc` o `EXPO_PUBLIC_API_URL`) come `serverOrigin` del QR. Il claim screen mostra l'origin attivo in chiaro. Per scenari multi-server (incluso `.onion`), il `ServerStatusModal` permette di sostituire il default prima di iniziare il pairing.
+
+### Multi-device cache refresh — scoperta di nuovi device dei peer
+
+`sessionService.deviceMap` (`userId → Set<deviceId>`) è la cache che alimenta il fan-out send in `chat.service.encrypt`: per ogni messaggio uscente si emette un ciphertext per ogni `(peerUserId, deviceId)` conosciuto. Senza un meccanismo di refresh, quando un peer linka un nuovo device dopo che abbiamo già stabilito la sessione, i suoi nuovi device non riescono mai a decifrare i nostri messaggi.
+
+**Tre livelli di copertura (fallback progressivo):**
+
+| Livello | Trigger | Latenza | File |
+|---|---|---|---|
+| 1. Refresh in `syncRoomMembersAndSessions` | Ogni `onConnected` socket | ~secondi al reconnect | `chat.service.ts` |
+| 2. Persistenza `remoteKnownDevices` CSV in `session` | Cold start app | Hot al primo send dopo restart | `session.repository.ts`, `client.ts` (migration v4) |
+| 3. Push socket `peerDeviceLinked` dal backend | Quando il peer completa un link | Near-realtime se entrambi online | `socket.service.ts`, `chat.service.ts` |
+
+**Componenti chiave:**
+
+- `sessionService.refreshRemoteDeviceMap(roomId, remoteUserId, { force? })` — fetch `/keys/:userId` + `updateRemoteDeviceMap`, niente native, niente sessione. Throttle per-userId 60s. Chiamato da `syncRoomMembersAndSessions` per ogni membro (con o senza sessione), dedupato per userId. **Anche per `ownUserId`** (force:true, una sola volta per sync per server): `GET /chat/:id/members` filtra fuori il requester, quindi senza un refresh esplicito self la `deviceMap[ownUserId]` resterebbe vuota e il self-fanout in `encrypt()` non emetterebbe entry per i nostri linked device. Stesso refresh self gira eager nell'handler `onDeviceLinked` (invalidate + force refresh) così il primo send dopo il linking include subito il nuovo device.
+- `sessionService.invalidateRemoteDeviceMap(userId)` — droppa la cache + svuota il CSV persistito. Chiamato dal handler `peerDeviceLinked` per invalidare e re-fetch eager.
+- `updateRemoteDeviceMap()` persiste la lista come CSV `1,2,5` nel campo `session.remote_known_devices` (denormalizzato — replicato su ogni riga session per quell'utente, valore <200 char).
+- `loadSessions()` reidrata `deviceMap` dal CSV al boot — il primo send dopo restart non cade più su `[PRIMARY_DEVICE_ID]`.
+- `setSession()` con sessione esistente fa **anche** `refreshRemoteDeviceMap()` (detached) — niente più early-return cieca al device map outdated.
+- `sessionService.ensureSessionForRemotePeerDevice(roomId, remoteUserId, deviceId)` — analogo a `ensureSessionForOwnLinkedDevice` ma per i peer. Lazy session establishment per-(userId, deviceId): la deviceMap può includere device linkati DOPO il `setSession` originale, e libsignal non avrebbe la sessione per `(peer, newDeviceId)`. Lookup `findByUserRoomAndDevice` → resume se esiste, altrimenti `/keys/:userId` + pick bundle per `deviceId` + `setRemoteUserKeys` + `establishSession` + upsert riga per-device. Chiamato dal fan-out di `chat.service.encrypt` per ogni `deviceId !== PRIMARY_DEVICE_ID`. Errori su device non-primary swallowati con warn (non droppano il messaggio per il primary del peer).
+- **Receive path multi-device**: `chat.service.decrypt(body, roomId, fromUserId, fromDeviceId?)` forwarda il `senderDeviceId` al native `SignalProtocol.decryptMessage(body, remoteUserId, deviceId)`. Senza questo, il native faceva default a `deviceId=1` e un messaggio da un linked device del peer veniva decifrato contro la sessione del primary → protobuf decode error. Entrambi i call site (`handleUserMessage` e `handleControlPacket`) passano `envelope.device_id_from`. `sessionService.ensureSessionInDatabase` accetta anche `deviceId` e usa `findByUserRoomAndDevice` per la check di esistenza, così la riga session viene persistita per il device specifico e `loadSessions` resume tutte le sessioni multi-device al boot.
+- **Self-fan-out visibility**: il filtro "skip own messages" in `handleIncomingMessage` e in `decrypt` scarta una entry SOLO quando `device_id_from` è **esplicitamente presente** (`typeof === 'number'`) E coincide con `ownDeviceId` (true echo del proprio device). Se l'envelope non porta `device_id_from`, NON si classifica come echo: il dedup downstream (`processingMessages` per `category:id` + `messageRepository.findById` in `handleUserMessage`) cattura comunque i veri echos. Questo è necessario perché il backend (o specifici code path come il self-fanout) può consegnare un envelope senza `senderDeviceId`: il fallback al `PRIMARY_DEVICE_ID` farebbe coincidere `senderDeviceId === ownDeviceId === 1` sul primary e droppasse il self-fanout dei linked device. Il mobile non setta `device_id_from` nelle `MessageEnvelopeFactory.create*` outgoing — solo il desktop lo fa — quindi la resilienza in ricezione è necessaria. `handleUserMessage` riconosce `isSelfFanout` e setta `idStatus = MessageStatus.SENT` (render lato proprio della bubble), salta unread counter/haptic/banner, e non emette `MESSAGE_DELIVERED`/`MESSAGE_READ` ack (non ha senso ack a se stesso).
+
+**Spec & coordination:** evento `peerDeviceLinked` in `_shared/api/peer-device-linked.md`; task in `_shared/tasks/frontend-0008-multi-device-cache-refresh.md` (frontend) e `backend-0009-peer-device-linked-notify.md` (backend, done 2026-05-21).
+
+### Multi-device send — wire shape `sendMessage`
+
+Il fan-out per-device cifra un ciphertext per ogni `(userId, deviceId)` e li manda nello stesso emit `sendMessage`. Il gateway backend instrada al path multi-device (`fanOutToRecipients`) **solo** se `recipients[]` è **top-level** nel payload del socket — se annidato dentro `message.payload` cade sul path legacy `sendToRoom` che fa broadcast singolo e filtra per `userId`, scartando *tutti* i device del mittente (il mittente non vede mai il proprio messaggio sui suoi altri device).
+
+**Due wire shape, scelte da `socket.sendMessage` (due overload):**
+
+| Shape | Payload emesso | Quando |
+|---|---|---|
+| Fan-out | `{ roomId, recipients[], metadata?, category, type, volatile? }` | Path pair-wise / encrypted (`encryptedData.recipients` popolato) |
+| Legacy | `{ roomId, message, category, type, volatile? }` | Path sender-key (un solo ciphertext per la room) |
+
+- `RecipientFanout = { userId: number, deviceId: number, ciphertext: string }`. `userId` **deve essere numerico** sul wire — il backend `FanoutRecipientDto` usa `@IsNumber()` senza `enableImplicitConversion`, quindi una stringa viene rifiutata dal `ValidationPipe`, il gateway non invoca l'handler, e il client va in timeout 30s. `recipients[]`, `metadata`, `volatile` viaggiano **top-level**, mai dentro `message`.
+- `SendMessageMetadata = { id_parent?, version? }` — metadata envelope-level che devono sopravvivere al fan-out (l'envelope per-device è ricostruito dal backend). `metadata` è omesso se vuoto.
+- `chat.service.emitSendMessage(socket, roomId, serverBody, category, type)` è l'unico punto che instrada: ispeziona `serverBody.payload.recipients` → fan-out vs legacy. Tutti i call site di send (`sendEnvelope`, `sendPersistentImage`, `sendEphemeralImage`, `sendFileMessage`, `retryMessageSend`, e il drain della retry queue in `queueService.setSendFunction`) passano da qui.
+- La retry queue continua a salvare `serverBody` con `payload.recipients` annidato (local state invariato); `emitSendMessage` traduce nel wire shape giusto al drain.
+- **Nota:** `sendControlPacket` → `socket.sendPacket` annida ancora `recipients` in `envelope.payload` (vecchio shape). Migrazione control packet a `recipients[]` top-level non ancora fatta — vedi `_shared/questions.md`.
+
+**Spec & coordination:** `_shared/specs/multidevice-send-wire-shape.md`, `_shared/api/multi-device-fanout.md`; task `frontend-0010` (done), `backend-0010`, `desktop-0012`.
+
 ### Categorie di messaggi
 
 - `user` — messaggi utente (testo, immagini, audio, video, file, posizione)
@@ -266,14 +404,12 @@ Il database usa un sistema di migrazioni a due livelli basato su `PRAGMA user_ve
 2. **`applyMigrations()`** — applica modifiche incrementali (`ALTER TABLE`, ecc.) ai database esistenti. Usa `PRAGMA user_version` per tracciare la versione corrente. Ogni statement è wrappato in try/catch per gestire il caso in cui la colonna esista già (fresh install).
 
 ```typescript
-// src/db/client.ts — array MIGRATIONS
+// src/db/client.ts — array MIGRATIONS (snippet, vedi file per la lista completa)
 const MIGRATIONS: { version: number; statements: string[] }[] = [
-  {
-    version: 1,
-    statements: [
-      'ALTER TABLE room ADD COLUMN administered INTEGER NOT NULL DEFAULT 0',
-    ],
-  },
+  { version: 1, statements: ['ALTER TABLE room ADD COLUMN administered ...'] },
+  { version: 2, statements: ['ALTER TABLE server ADD COLUMN is_tor ...'] },
+  { version: 3, statements: ['DROP INDEX ...', 'CREATE UNIQUE INDEX ... session(id_user, id_room, remote_user_device_id)'] },
+  { version: 4, statements: ['ALTER TABLE session ADD COLUMN remote_known_devices TEXT'] },
 ];
 ```
 
@@ -554,7 +690,31 @@ Accesso DB sempre tramite repository (`src/db/repositories/`):
 
 ### Serial message queue
 
-`chatService.messageQueue` serializza **tutte** le operazioni di encrypt/decrypt del Signal Protocol. Il modulo nativo NON è thread-safe — operazioni concorrenti corrompono il ratchet state. Non rimuovere mai la serializzazione.
+`chatService.messageQueue` serializza **tutte** le operazioni di encrypt/decrypt del Signal Protocol. Il modulo nativo NON è thread-safe — operazioni concorrenti corrompono il ratchet state. Non rimuovere mai la serializzazione **delle operazioni Signal Protocol**.
+
+**Quello che NON sta sulla coda — di proposito:** il `socket.sendPacket` dei control packet (network emit + ack-await del backend) gira **detached**, fuori dalla catena del `messageQueue`. Un ack del backend lento (lo zombie di `backend-0015` = 5 s) non blocca più i `sendMessage` accodati dopo. In `sendControlPacket` solo `encryptStep` (l'encrypt vero) è sulla coda; `networkStep` parte fire-and-forget. Vedi `_shared/tasks/frontend-0015-…md`. `sendEnvelope` (messaggi utente) continua invece a tenere il network sulla coda — è un sotto-caso meno frequente e attende `backend-0015` per il vero fix lato server.
+
+### Receipt coalescing & dedup
+
+- `markRoomAsRead` raggruppa gli id non letti per `idUserFrom` ed emette **un** `MESSAGE_READ` per sender con shape `{ id_message: last, id_messages: [...] }`. Per N=1 mantiene lo shape legacy `{ id_message }`. Contratto wire (decifrato, E2E — backend opaco): `_shared/api/control-packet-read-coalesced.md`.
+- `processControlPacket` MESSAGE_READ legge `id_messages[]` se presente, fallback a `id_message`. Un peer che invia solo `id_message` continua a funzionare.
+- `handleUserMessage` / `handleSenderKeyMessage` inviano **un solo** packet per messaggio ricevuto: READ se la room è aperta, altrimenti DELIVERED. READ implica DELIVERED — niente più doppio invio.
+- `sendTypingStopped` NON azzera il throttle di `typing_start`: il primo keystroke dopo lo stop non ri-arma un `typing_start` finché la finestra `TYPING_THROTTLE_MS` non scade. Lo stato attivo è tracciato da `typingActiveRooms: Set<number>` per emettere un solo `typing_stop` per burst.
+
+### Multi-device read sync (self-fanout MESSAGE_READ)
+
+Quando un altro device dello stesso utente legge una conversazione, spedisce un packet `MESSAGE_READ` con `recipients[]` top-level che include anche le entry self-fanout. Il packet arriva su questo device tramite `processControlPacket → case MESSAGE_READ`. Il ramo è ora **orientato self-vs-peer** (`isSelfFanout = fromUserId === selfUserId || fromUserId === serverUserId`):
+
+- **Self-fanout + target incoming** (`idUserFrom !== selfUserId && != serverUserId`): stampa il timestamp `read` sulla row incoming via `messageRepository.markAsRead(id)` (idempotente: `WHERE read IS NULL`) + `updateMessage({ read, idStatus: READ })`. A fine ciclo, se almeno una row è stata applicata: `recomputeRoomUnread(roomId)` (query DB `countUnreadIncoming(roomId, [selfUserId, serverUserId])`) → `updateRoomInList({ unreadCount })` + `refreshOsBadge()` (somma `allRooms[].unreadCount` → `Notifications.setBadgeCountAsync`).
+- **Peer-read path invariato** (altrimenti): blind idStatus advance se `< READ`. Anche envelope malformati (claim self-fanout ma target outgoing) cadono qui — robusto.
+- **Nessun haptic/banner/"new message"** sul ramo self-sync — stessa filosofia di `handleUserMessage` con `isSelfFanout`.
+- **MESSAGE_DELIVERED**: early-return su `isSelfFanout` (DELIVERED da sé verso sé non ha semantica).
+
+`markRoomAsRead` (apertura chat locale) chiama anch'esso `refreshOsBadge` dopo l'azzeramento, chiudendo il mini-gap UX del badge OS che restava fino al foreground successivo. Spec: `_shared/api/multi-device-read-sync.md`, ADR `_shared/decisions/0006-multi-device-read-sync.md`.
+
+### resumeSession memoization (modulo nativo)
+
+`SignalProtocol.resumeSession` (iOS + Android) controlla la cache `(userId, deviceId)` PRIMA di ricostruire un `EncryptedSession`: se la entry è calda, ritorna `"Session already warm"` senza riaprire gli store cifrati (`EncryptedSharedPreferences` / Keychain) e senza sovrascrivere l'istanza che già porta lo stato del Double Ratchet. Il path di ricostruzione esplicita (recovery dopo decrypt error, rotazione chiavi) passa per `setRemoteUserKeys` ed è intatto — `resumeSession` non è più l'unico modo di scaldare la cache. Vedi `_shared/tasks/frontend-0016-…md`.
 
 ## Costanti chiave
 
