@@ -80,6 +80,30 @@ class SignalProtocolModule : Module() {
         name: String,
         importedIdentity: IdentityKeyPair?
     ): Map<String, Any> {
+        // Atomicity: any failure between the first persistent write (the
+        // identity keypair in EncryptedSharedPreferences) and the last (the
+        // pre-key / signed-pre-key / kyber stores being populated) is rolled
+        // back via `resetIdentityState()`. That avoids the half-installed
+        // state where the identity is in protected storage but
+        // `loadStoredLocalUser` can't reconstruct a LocalUser because the
+        // metadata or the pre-key store entries are missing — which previously
+        // required a reinstall to recover.
+        try {
+            return performIdentitySetupUnsafe(deviceId, name, importedIdentity)
+        } catch (e: Throwable) {
+            // Roll back to a clean state so the next attempt (or a future
+            // `loadStoredLocalUser`) doesn't trip over half-installed material.
+            // Re-throws the original error so the caller sees the real cause.
+            resetIdentityState()
+            throw e
+        }
+    }
+
+    private fun performIdentitySetupUnsafe(
+        deviceId: Int,
+        name: String,
+        importedIdentity: IdentityKeyPair?
+    ): Map<String, Any> {
         val keystoreHelper = KeystoreHelper.getInstance(context)
 
         val keys = KeyGeneration.generateKeys(existingIdentity = importedIdentity)
@@ -117,7 +141,8 @@ class SignalProtocolModule : Module() {
         metadata.put("kyberPreKeys", kyberPreKeysArray)
 
         if (!keystoreHelper.save(localUserMetadataStorageKey, metadata.toString().toByteArray(Charsets.UTF_8))) {
-            keystoreHelper.deleteProtected(identityKeyPairStorageKey)
+            // Rollback handled by performIdentitySetup's outer catch — keep this
+            // branch lean: just signal the failure.
             throw Exception("Failed to save metadata")
         }
 
@@ -186,6 +211,42 @@ class SignalProtocolModule : Module() {
             return out
         }
         return data
+    }
+
+    // Constant-time byte comparison. Used by the pairing integrity check
+    // (peekProvisioningPayload / consumeProvisioningPayload): a server-side
+    // attacker who can resubmit candidate payloads must not be able to mount
+    // a timing side-channel against the trusted identityKeyPub by varying
+    // the candidate byte-by-byte. Short-circuiting `!=` on Strings would leak
+    // the matching prefix length through response time.
+    private fun constantTimeEquals(a: ByteArray, b: ByteArray): Boolean {
+        if (a.size != b.size) return false
+        var diff = 0
+        for (i in a.indices) {
+            diff = diff or (a[i].toInt() xor b[i].toInt())
+        }
+        return diff == 0
+    }
+
+    // Drop all on-device identity material and reset every in-memory store.
+    // Shared by `clearIdentity` (user-initiated wipe) and by the catch path
+    // in `performIdentitySetup` (rollback when a fresh install fails halfway
+    // through, e.g. the EncryptedSharedPreferences write for the metadata
+    // succeeds but the pre-key store write does not). Centralising the
+    // cleanup makes the atomicity guarantee in `performIdentitySetup`
+    // explicit: either every store ends up populated, or nothing remains.
+    private fun resetIdentityState() {
+        val ctx = appContext.reactContext ?: return
+        val keystoreHelper = KeystoreHelper.getInstance(ctx)
+        keystoreHelper.clearAll()
+        localUser = null
+        encryptedSessions.clear()
+
+        senderKeyStore = PersistentSenderKeyStore("TilliTSenderKeys", ctx)
+        val sharedStorePrefix = "TilliTLocalKeys"
+        sharedPreKeyStore = PersistentPreKeyStore(sharedStorePrefix, ctx)
+        sharedSignedPreKeyStore = PersistentSignedPreKeyStore(sharedStorePrefix, ctx)
+        sharedKyberPreKeyStore = PersistentKyberPreKeyStore(sharedStorePrefix, ctx)
     }
 
     private fun encryptProvisioningEnvelope(
@@ -351,18 +412,12 @@ class SignalProtocolModule : Module() {
         }
 
         AsyncFunction("clearIdentity") {
-            val keystoreHelper = KeystoreHelper.getInstance(context)
-            keystoreHelper.clearAll()
-            localUser = null
-            encryptedSessions.clear()
-
-            // H-01 FIX: Re-initialize all shared stores to prevent stale pre-keys
-            // from a previous identity being used after re-login in the same app session
-            senderKeyStore = PersistentSenderKeyStore("TilliTSenderKeys", context)
-            val sharedStorePrefix = "TilliTLocalKeys"
-            sharedPreKeyStore = PersistentPreKeyStore(sharedStorePrefix, context)
-            sharedSignedPreKeyStore = PersistentSignedPreKeyStore(sharedStorePrefix, context)
-            sharedKyberPreKeyStore = PersistentKyberPreKeyStore(sharedStorePrefix, context)
+            // Clear ALL keystore entries and re-initialize the in-memory shared
+            // stores so stale pre-keys from a previous identity can't be reused
+            // after re-login in the same session. Shared with the catch path of
+            // `performIdentitySetup` so a failed pairing leaves the device in
+            // the same state as an explicit wipe.
+            resetIdentityState()
         }
 
         AsyncFunction("setLocalUserId") { userId: String ->
@@ -614,12 +669,16 @@ class SignalProtocolModule : Module() {
             putEncryptedSession(remoteUserId, deviceId, session)
         }
 
-        AsyncFunction("establishSession") { remoteUserId: String ->
-            // NOTE (multi-device): establishSession is invoked by JS after
-            // setRemoteUserKeys, which is keyed by (userId, deviceId). This
-            // status check falls back to the default deviceId=1 slot;
-            // multi-device callers can confirm via decryptMessage anyway.
-            if (getEncryptedSession(remoteUserId) == null) {
+        AsyncFunction("establishSession") { remoteUserId: String, remoteDeviceId: Int? ->
+            // Multi-device (ADR-0001 D4): the session slot is keyed by
+            // `(userId, deviceId)`. The JS caller passes the deviceId for
+            // which it just called setRemoteUserKeys; without that the
+            // existence check would always look at slot `(userId, 1)` and
+            // reject "Session is not initialized" for every linked-device
+            // peer (deviceId != 1) — even when a valid session was just
+            // stored. Default 1 keeps single-device peers unchanged.
+            val effectiveDeviceId = remoteDeviceId ?: 1
+            if (getEncryptedSession(remoteUserId, effectiveDeviceId) == null) {
                 throw Exception("Session is not initialized. Set local and remote user keys first.")
             }
 
@@ -798,11 +857,18 @@ class SignalProtocolModule : Module() {
 
             // Integrity check: identityKeyPub must equal the public half of
             // the deserialized keypair. Catches a tampered payload here, BEFORE
-            // we hand the resulting safety number to the user.
+            // we hand the resulting safety number to the user. Compared in
+            // constant time so a server-side attacker cannot mount a timing
+            // side-channel against the trusted identityKeyPub.
             val serializedBytes = Base64.decode(serializedB64, Base64.NO_WRAP)
             val importedIdentity = IdentityKeyPair(serializedBytes)
-            val recoveredPub = Base64.encodeToString(importedIdentity.publicKey.serialize(), Base64.NO_WRAP)
-            if (recoveredPub != identityPubB64) {
+            val recoveredPubBytes = importedIdentity.publicKey.serialize()
+            val claimedPubBytes = try {
+                Base64.decode(identityPubB64, Base64.NO_WRAP)
+            } catch (e: Exception) {
+                throw Exception("Provisioning payload integrity check failed: invalid identityKeyPub encoding")
+            }
+            if (!constantTimeEquals(recoveredPubBytes, claimedPubBytes)) {
                 throw Exception("Provisioning payload integrity check failed: identityKeyPub does not match identityKeySerialized")
             }
 
@@ -849,9 +915,16 @@ class SignalProtocolModule : Module() {
 
             // Cross-check: the embedded identityKeyPub MUST match the public
             // key we recover from the serialized keypair. Detects a malformed
-            // or tampered payload before it reaches the Keystore.
-            val recoveredPub = Base64.encodeToString(importedIdentity.publicKey.serialize(), Base64.NO_WRAP)
-            if (recoveredPub != identityPubB64) {
+            // or tampered payload before it reaches the Keystore. Compared in
+            // constant time so a server-side attacker cannot mount a timing
+            // side-channel against the trusted identityKeyPub.
+            val recoveredPubBytes = importedIdentity.publicKey.serialize()
+            val claimedPubBytes = try {
+                Base64.decode(identityPubB64, Base64.NO_WRAP)
+            } catch (e: Exception) {
+                throw Exception("Provisioning payload integrity check failed: invalid identityKeyPub encoding")
+            }
+            if (!constantTimeEquals(recoveredPubBytes, claimedPubBytes)) {
                 throw Exception("Provisioning payload integrity check failed: identityKeyPub does not match identityKeySerialized")
             }
 

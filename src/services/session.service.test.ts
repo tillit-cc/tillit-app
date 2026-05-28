@@ -221,7 +221,7 @@ describe('SessionService', () => {
         kyberPreKeySignature: 'ksig==',
       })
     );
-    expect(SignalProtocol.establishSession).toHaveBeenCalledWith('99');
+    expect(SignalProtocol.establishSession).toHaveBeenCalledWith('99', 1);
     expect(mockSessionRepo.upsert).toHaveBeenCalledWith(
       expect.objectContaining({
         idUser: '99',
@@ -286,7 +286,7 @@ describe('SessionService', () => {
     expect(SignalProtocol.resumeSession).toHaveBeenCalledWith('99', 'alice', 1);
     // recoverSession should call setRemoteUserKeys (via reloadRemoteKeys) then establishSession
     expect(SignalProtocol.setRemoteUserKeys).toHaveBeenCalled();
-    expect(SignalProtocol.establishSession).toHaveBeenCalledWith('99');
+    expect(SignalProtocol.establishSession).toHaveBeenCalledWith('99', 1);
   });
 
   // ==========================================================================
@@ -314,7 +314,7 @@ describe('SessionService', () => {
 
     // setSession success path
     expect(result).toBe(true);
-    expect(SignalProtocol.establishSession).toHaveBeenCalledWith('99');
+    expect(SignalProtocol.establishSession).toHaveBeenCalledWith('99', 1);
   });
 
   // ==========================================================================
@@ -415,7 +415,7 @@ describe('SessionService', () => {
     expect(SignalProtocol.setRemoteUserKeys).toHaveBeenCalledWith(
       expect.objectContaining({ remoteUserId: '99' })
     );
-    expect(SignalProtocol.establishSession).toHaveBeenCalledWith('99');
+    expect(SignalProtocol.establishSession).toHaveBeenCalledWith('99', 1);
   });
 
   // ==========================================================================
@@ -456,7 +456,7 @@ describe('SessionService', () => {
     expect(SignalProtocol.setRemoteUserKeys).toHaveBeenCalledWith(
       expect.objectContaining({ remoteUserId: '99', identityPublicKey: 'idKey==' })
     );
-    expect(SignalProtocol.establishSession).toHaveBeenCalledWith('99');
+    expect(SignalProtocol.establishSession).toHaveBeenCalledWith('99', 1);
     expect(mockAppState.addSecurityAlert).not.toHaveBeenCalled();
   });
 
@@ -473,7 +473,7 @@ describe('SessionService', () => {
     await expect(sessionService.recoverSession(10, '99', 'alice')).resolves.toBeUndefined();
 
     expect(SignalProtocol.setRemoteUserKeys).toHaveBeenCalled();
-    expect(SignalProtocol.establishSession).toHaveBeenCalledWith('99');
+    expect(SignalProtocol.establishSession).toHaveBeenCalledWith('99', 1);
     expect(mockAppState.addSecurityAlert).not.toHaveBeenCalled();
   });
 

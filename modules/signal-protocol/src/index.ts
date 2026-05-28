@@ -47,7 +47,10 @@ interface SignalProtocolModuleInterface extends NativeModule {
   // ===== SESSION MANAGEMENT =====
   setLocalUserId(userId: string): Promise<{ success: boolean }>;
   setRemoteUserKeys(params: RemoteUserKeys): Promise<void>;
-  establishSession(remoteUserId: string): Promise<SessionResult>;
+  establishSession(
+    remoteUserId: string,
+    remoteDeviceId?: number | null
+  ): Promise<SessionResult>;
   resumeSession(
     remoteUserId: string,
     remoteUserName: string,
@@ -249,9 +252,16 @@ export const SignalProtocol = {
 
   /**
    * Establish a session with a remote user (after setRemoteUserKeys).
+   *
+   * `remoteDeviceId` selects which session slot to verify — libsignal's store
+   * is indexed by `(remoteUserId, deviceId)`. Defaults to 1 if omitted, for
+   * backward-compat with single-device peers. Multi-device callers MUST pass
+   * the same deviceId they used in the preceding `setRemoteUserKeys` call,
+   * otherwise the existence check looks at the wrong slot and rejects with
+   * "Session not initialized" even when a valid session was just stored.
    */
-  establishSession: (remoteUserId: string) =>
-    SignalProtocolModule.establishSession(remoteUserId),
+  establishSession: (remoteUserId: string, remoteDeviceId?: number | null) =>
+    SignalProtocolModule.establishSession(remoteUserId, remoteDeviceId ?? null),
 
   /**
    * Resume an existing session with a remote user.

@@ -70,6 +70,41 @@ public class SignalProtocolModule: Module {
         return data
     }
 
+    // Constant-time byte comparison. Used by the pairing integrity check
+    // (peekProvisioningPayload / consumeProvisioningPayload): a server-side
+    // attacker who can resubmit candidate payloads must not be able to mount
+    // a timing side-channel against the trusted identityKeyPub by varying
+    // the candidate byte-by-byte. Short-circuiting `==` would leak the
+    // matching prefix length through response time.
+    private static func constantTimeEquals(_ a: Data, _ b: Data) -> Bool {
+        if a.count != b.count { return false }
+        var diff: UInt8 = 0
+        for i in 0..<a.count {
+            diff |= a[a.startIndex + i] ^ b[b.startIndex + i]
+        }
+        return diff == 0
+    }
+
+    // Drop all on-device identity material and reset every in-memory store.
+    // Shared by `clearIdentity` (user-initiated wipe) and by the catch path
+    // in `performIdentitySetup` (rollback when a fresh install fails halfway
+    // through, e.g. the Keychain write for the metadata succeeds but the
+    // pre-key store write does not). Centralising the cleanup makes the
+    // atomicity guarantee in `performIdentitySetup` explicit: either every
+    // store ends up populated, or nothing remains.
+    private func resetIdentityState() {
+        KeychainHelper.shared.clearAll()
+        self.localUser = nil
+        self.removeAllSessions()
+
+        let senderKeyDirectory = URL(fileURLWithPath: "TilliTSenderKeys")
+        self.senderKeyStore = PersistentSenderKeyStore(directoryURL: senderKeyDirectory)
+        let sharedStoreDirectory = URL(fileURLWithPath: "TilliTLocalKeys")
+        self.sharedPreKeyStore = PersistentPreKeyStore(directoryURL: sharedStoreDirectory)
+        self.sharedSignedPreKeyStore = PersistentSignedPreKeyStore(directoryURL: sharedStoreDirectory)
+        self.sharedKyberPreKeyStore = PersistentKyberPreKeyStore(directoryURL: sharedStoreDirectory)
+    }
+
     // M-02: Load metadata with migration from standard to protected keychain
     private func loadMetadata() -> Data? {
         let keychain = KeychainHelper.shared
@@ -94,84 +129,92 @@ public class SignalProtocolModule: Module {
     // pre-keys, kyber pre-keys, registrationId) are always generated fresh
     // — per-device material, never shared across linked devices.
     private func performIdentitySetup(deviceId: Int, name: String, importedIdentity: IdentityKeyPair?) throws -> [String: Any] {
-        let keys = try KeyGeneration.generateKeys(existingIdentity: importedIdentity)
+        // Atomicity: any failure between the first persistent write (the
+        // identity keypair in the Keychain) and the last (the pre-key /
+        // signed-pre-key / kyber stores being populated) is rolled back via
+        // `resetIdentityState()`. That avoids the half-installed state
+        // where the identity is in the Keychain but `loadStoredLocalUser`
+        // can't reconstruct a LocalUser because the metadata or the
+        // pre-key store entries are missing — which previously required
+        // a reinstall to recover.
+        do {
+            let keys = try KeyGeneration.generateKeys(existingIdentity: importedIdentity)
 
-        let identityKeyPairData = Data(keys.identityKeyPair.serialize())
-        let signedPreKeyRecordData = Data(keys.signedPreKeyRecord.serialize())
+            let identityKeyPairData = Data(keys.identityKeyPair.serialize())
+            let signedPreKeyRecordData = Data(keys.signedPreKeyRecord.serialize())
 
-        let preKeysArray: [[String: Any]] = keys.preKeys.compactMap { preKeyRecord in
-            do {
-                let publicKeyData = try preKeyRecord.publicKey().serialize()
-                return [
-                    "id": preKeyRecord.id,
-                    "publicKey": Data(publicKeyData).base64EncodedString(),
-                    "key": Data(preKeyRecord.serialize()).base64EncodedString()
-                ]
-            } catch {
-                return nil
+            let preKeysArray: [[String: Any]] = keys.preKeys.compactMap { preKeyRecord in
+                do {
+                    let publicKeyData = try preKeyRecord.publicKey().serialize()
+                    return [
+                        "id": preKeyRecord.id,
+                        "publicKey": Data(publicKeyData).base64EncodedString(),
+                        "key": Data(preKeyRecord.serialize()).base64EncodedString()
+                    ]
+                } catch {
+                    return nil
+                }
             }
-        }
 
-        let kyberPreKeysArray: [[String: Any]] = keys.kyberPreKeys.compactMap { kyberPreKey in
-            do {
-                let publicKeyData = try kyberPreKey.publicKey().serialize()
-                return [
-                    "id": kyberPreKey.id,
-                    "publicKey": Data(publicKeyData).base64EncodedString(),
-                    "signature": kyberPreKey.signature.base64EncodedString(),
-                    "key": Data(kyberPreKey.serialize()).base64EncodedString()
-                ]
-            } catch {
-                return nil
+            let kyberPreKeysArray: [[String: Any]] = keys.kyberPreKeys.compactMap { kyberPreKey in
+                do {
+                    let publicKeyData = try kyberPreKey.publicKey().serialize()
+                    return [
+                        "id": kyberPreKey.id,
+                        "publicKey": Data(publicKeyData).base64EncodedString(),
+                        "signature": kyberPreKey.signature.base64EncodedString(),
+                        "key": Data(kyberPreKey.serialize()).base64EncodedString()
+                    ]
+                } catch {
+                    return nil
+                }
             }
-        }
 
-        let keychain = KeychainHelper.shared
+            let keychain = KeychainHelper.shared
 
-        guard keychain.saveProtected(data: identityKeyPairData, for: self.identityKeyPairKeychainKey) else {
-            throw NSError(domain: "SignalProtocol", code: 500, userInfo: [NSLocalizedDescriptionKey: "Failed to save identity key pair"])
-        }
+            guard keychain.saveProtected(data: identityKeyPairData, for: self.identityKeyPairKeychainKey) else {
+                throw NSError(domain: "SignalProtocol", code: 500, userInfo: [NSLocalizedDescriptionKey: "Failed to save identity key pair"])
+            }
 
-        let metadata: [String: Any] = [
-            "registrationId": keys.registrationId,
-            "deviceId": deviceId,
-            "name": name,
-            "signedPreKeyRecord": signedPreKeyRecordData.base64EncodedString(),
-            "preKeys": preKeysArray,
-            "kyberPreKeys": kyberPreKeysArray
-        ]
+            let metadata: [String: Any] = [
+                "registrationId": keys.registrationId,
+                "deviceId": deviceId,
+                "name": name,
+                "signedPreKeyRecord": signedPreKeyRecordData.base64EncodedString(),
+                "preKeys": preKeysArray,
+                "kyberPreKeys": kyberPreKeysArray
+            ]
 
-        guard let metadataJson = try? JSONSerialization.data(withJSONObject: metadata),
-              keychain.saveProtected(data: metadataJson, for: self.localUserMetadataKeychainKey) else {
-            keychain.delete(for: self.identityKeyPairKeychainKey)
-            throw NSError(domain: "SignalProtocol", code: 500, userInfo: [NSLocalizedDescriptionKey: "Failed to save metadata"])
-        }
+            guard let metadataJson = try? JSONSerialization.data(withJSONObject: metadata),
+                  keychain.saveProtected(data: metadataJson, for: self.localUserMetadataKeychainKey) else {
+                throw NSError(domain: "SignalProtocol", code: 500, userInfo: [NSLocalizedDescriptionKey: "Failed to save metadata"])
+            }
 
-        let localUser = try LocalUser(
-            identityKey: keys.identityKeyPair,
-            registrationId: UInt32(keys.registrationId),
-            preKeys: keys.preKeys,
-            signedPreKey: keys.signedPreKeyRecord,
-            kyberPreKeys: keys.kyberPreKeys,
-            deviceId: UInt32(deviceId),
-            name: name
-        )
-        self.localUser = localUser
+            let localUser = try LocalUser(
+                identityKey: keys.identityKeyPair,
+                registrationId: UInt32(keys.registrationId),
+                preKeys: keys.preKeys,
+                signedPreKey: keys.signedPreKeyRecord,
+                kyberPreKeys: keys.kyberPreKeys,
+                deviceId: UInt32(deviceId),
+                name: name
+            )
+            self.localUser = localUser
 
-        let context = NullContext()
-        for preKey in localUser.preKeys {
-            try self.sharedPreKeyStore?.storePreKey(preKey, id: preKey.id, context: context)
-        }
-        try self.sharedSignedPreKeyStore?.storeSignedPreKey(
-            localUser.signedPreKey,
-            id: localUser.signedPreKey.id,
-            context: context
-        )
-        for kyberPreKey in localUser.kyberPreKeys {
-            try self.sharedKyberPreKeyStore?.storeKyberPreKey(kyberPreKey, id: kyberPreKey.id, context: context)
-        }
+            let context = NullContext()
+            for preKey in localUser.preKeys {
+                try self.sharedPreKeyStore?.storePreKey(preKey, id: preKey.id, context: context)
+            }
+            try self.sharedSignedPreKeyStore?.storeSignedPreKey(
+                localUser.signedPreKey,
+                id: localUser.signedPreKey.id,
+                context: context
+            )
+            for kyberPreKey in localUser.kyberPreKeys {
+                try self.sharedKyberPreKeyStore?.storeKyberPreKey(kyberPreKey, id: kyberPreKey.id, context: context)
+            }
 
-        return [
+            return [
             "registrationId": keys.registrationId,
             "deviceId": deviceId,
             "identityPublicKey": keys.identityKeyPublicBase64(),
@@ -204,6 +247,14 @@ public class SignalProtocolModule: Module {
                 }
             }
         ]
+        } catch {
+            // Roll back to a clean state so the next attempt (or a future
+            // `loadStoredLocalUser`) doesn't trip over half-installed
+            // material. Re-throws the original error so the caller sees the
+            // real cause, not the rollback.
+            self.resetIdentityState()
+            throw error
+        }
     }
 
     // Shared ECDHE + HKDF + AES-256-GCM decrypt for the multi-device
@@ -399,20 +450,12 @@ public class SignalProtocolModule: Module {
 
         AsyncFunction("clearIdentity") { () in
             // Clear ALL keychain entries (pre-keys, signed pre-keys, kyber pre-keys,
-            // sessions, identity keys, sender keys, trust entries, metadata)
-            // to prevent orphaned entries accumulating across identity re-creations
-            KeychainHelper.shared.clearAll()
-            self.localUser = nil
-            self.removeAllSessions()
-
-            // H-01 FIX: Re-initialize all shared stores to prevent stale pre-keys
-            // from a previous identity being used after re-login in the same app session
-            let senderKeyDirectory = URL(fileURLWithPath: "TilliTSenderKeys")
-            self.senderKeyStore = PersistentSenderKeyStore(directoryURL: senderKeyDirectory)
-            let sharedStoreDirectory = URL(fileURLWithPath: "TilliTLocalKeys")
-            self.sharedPreKeyStore = PersistentPreKeyStore(directoryURL: sharedStoreDirectory)
-            self.sharedSignedPreKeyStore = PersistentSignedPreKeyStore(directoryURL: sharedStoreDirectory)
-            self.sharedKyberPreKeyStore = PersistentKyberPreKeyStore(directoryURL: sharedStoreDirectory)
+            // sessions, identity keys, sender keys, trust entries, metadata) and
+            // re-initialize the in-memory shared stores so stale pre-keys from a
+            // previous identity can't be reused after re-login in the same session.
+            // Shared with the catch path of `performIdentitySetup` so a failed
+            // pairing leaves the device in the same state as an explicit wipe.
+            self.resetIdentityState()
         }
 
         AsyncFunction("setLocalUserId") { (userId: String) -> [String: Any] in
@@ -692,13 +735,16 @@ public class SignalProtocolModule: Module {
             self.setSession(remoteUserId, UInt32(deviceId), session: session)
         }
 
-        AsyncFunction("establishSession") { (remoteUserId: String) -> [String: Any] in
-            // NOTE (multi-device): establishSession is invoked by the JS
-            // session.service after setRemoteUserKeys, which is keyed by
-            // (userId, deviceId). The JS side already stored the session
-            // for the right (userId, deviceId) slot — this status check
-            // is best-effort. Falls back to the default deviceId=1 slot.
-            guard self.getSession(remoteUserId) != nil else {
+        AsyncFunction("establishSession") { (remoteUserId: String, remoteDeviceId: Int?) -> [String: Any] in
+            // Multi-device (ADR-0001 D4): the session slot is keyed by
+            // `(userId, deviceId)`. The JS caller passes the deviceId for
+            // which it just called setRemoteUserKeys; without that the
+            // existence check would always look at slot `(userId, 1)` and
+            // reject "Session not initialized" for every linked-device peer
+            // (deviceId != 1) — even when a valid session was just stored.
+            // Default 1 keeps single-device peers unchanged.
+            let effectiveDeviceId = UInt32(remoteDeviceId ?? 1)
+            guard self.getSession(remoteUserId, effectiveDeviceId) != nil else {
                 throw NSError(domain: "SignalProtocol", code: 404, userInfo: [NSLocalizedDescriptionKey: "Session not initialized"])
             }
             return ["status": "Session established successfully"]
@@ -894,10 +940,13 @@ public class SignalProtocolModule: Module {
 
             // Integrity check: identityKeyPub must equal the public half of
             // the deserialized keypair. Catches a tampered payload here, BEFORE
-            // we hand the resulting safety number to the user.
+            // we hand the resulting safety number to the user. Compared in
+            // constant time so a server-side attacker cannot mount a timing
+            // side-channel against the trusted identityKeyPub.
             let importedIdentity = try IdentityKeyPair(bytes: Array(serializedData))
-            let recoveredPub = Data(importedIdentity.publicKey.serialize()).base64EncodedString()
-            guard recoveredPub == identityPubB64 else {
+            let recoveredPubData = Data(importedIdentity.publicKey.serialize())
+            guard let claimedPubData = Data(base64Encoded: identityPubB64),
+                  Self.constantTimeEquals(recoveredPubData, claimedPubData) else {
                 throw NSError(domain: "SignalProtocol", code: 400, userInfo: [NSLocalizedDescriptionKey: "Provisioning payload integrity check failed: identityKeyPub does not match identityKeySerialized"])
             }
 
@@ -942,9 +991,12 @@ public class SignalProtocolModule: Module {
 
             // Cross-check: the embedded identityKeyPub MUST match the public
             // key we recover from the serialized keypair. Detects a malformed
-            // or tampered payload before it reaches the Keychain.
-            let recoveredPub = Data(importedIdentity.publicKey.serialize()).base64EncodedString()
-            guard recoveredPub == identityPubB64 else {
+            // or tampered payload before it reaches the Keychain. Compared in
+            // constant time so a server-side attacker cannot mount a timing
+            // side-channel against the trusted identityKeyPub.
+            let recoveredPubData = Data(importedIdentity.publicKey.serialize())
+            guard let claimedPubData = Data(base64Encoded: identityPubB64),
+                  Self.constantTimeEquals(recoveredPubData, claimedPubData) else {
                 throw NSError(domain: "SignalProtocol", code: 400, userInfo: [NSLocalizedDescriptionKey: "Provisioning payload integrity check failed: identityKeyPub does not match identityKeySerialized"])
             }
 

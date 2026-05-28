@@ -333,7 +333,7 @@ class SessionService {
         kyberPreKeySignature: formattedKeys.kyberPreKeySignature,
       });
 
-      await SignalProtocol.establishSession(remoteUserIdStr);
+      await SignalProtocol.establishSession(remoteUserIdStr, formattedKeys.deviceId);
       sessionEstablished = true;
       logger.info('[SessionService] Session established successfully');
     } catch (error: any) {
@@ -497,7 +497,7 @@ class SessionService {
         kyberPreKeyPublicKey: String(kyberPreKey.keyData),
         kyberPreKeySignature: String(kyberPreKey.signature),
       });
-      await SignalProtocol.establishSession(ownUserIdStr);
+      await SignalProtocol.establishSession(ownUserIdStr, deviceId);
 
       const now = Math.floor(Date.now() / 1000);
       await sessionRepository.upsert({
@@ -614,7 +614,7 @@ class SessionService {
         kyberPreKeyPublicKey: String(kyberPreKey.keyData),
         kyberPreKeySignature: String(kyberPreKey.signature),
       });
-      await SignalProtocol.establishSession(remoteUserIdStr);
+      await SignalProtocol.establishSession(remoteUserIdStr, deviceId);
 
       const now = Math.floor(Date.now() / 1000);
       await sessionRepository.upsert({
@@ -750,7 +750,12 @@ class SessionService {
 
     try {
       await this.applyRemoteKeys(remoteUserId, remoteKeys);
-      await SignalProtocol.establishSession(String(remoteUserId));
+      // Match the (userId, deviceId) slot that `applyRemoteKeys` just wrote
+      // via setRemoteUserKeys — without this, the existence check inside
+      // `establishSession` always looks at slot 1 and rejects when the
+      // remote user is on a linked device (deviceId != 1).
+      const recoveredDeviceId = Number(remoteKeys?.deviceId ?? 1) || 1;
+      await SignalProtocol.establishSession(String(remoteUserId), recoveredDeviceId);
       logger.info('[SessionService] Session recovered for', remoteUserId);
     } catch (error) {
       logger.error('[SessionService] Recovery failed:', error);
