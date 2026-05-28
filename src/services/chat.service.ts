@@ -3159,17 +3159,44 @@ class ChatService {
    * Refresh the OS badge to the sum of unread counts across all rooms in
    * the store. Lazy-required to keep tests / non-Notifications builds
    * happy and to avoid pulling in expo-notifications at module load.
+   *
+   * Debounced (M8): a single MESSAGE_READ self-fanout can fire `markAsRead`
+   * + `recomputeRoomUnread` + `refreshOsBadge` while the user is also
+   * tapping a room locally (which runs its own `markRoomAsRead` →
+   * `refreshOsBadge`). Both producers land on the same total but the OS
+   * badge would flicker between the intermediate and final values.
+   * Coalesce all calls within a 50ms window into the LATEST store state so
+   * `setBadgeCountAsync` only fires once with the converged total.
+   *
+   * Every caller's promise is parked in `badgeRefreshResolvers` and
+   * resolved together when the timer fires — `await refreshOsBadge()`
+   * therefore still waits for `setBadgeCountAsync` to complete, which the
+   * tests rely on.
    */
+  private badgeRefreshTimer: ReturnType<typeof setTimeout> | null = null;
+  private badgeRefreshResolvers: Array<() => void> = [];
   private async refreshOsBadge(): Promise<void> {
-    try {
-      const total = useChatStore
-        .getState()
-        .allRooms.reduce((sum, r) => sum + (r.unreadCount ?? 0), 0);
-      const Notifications = require('expo-notifications');
-      await Notifications.setBadgeCountAsync(Math.max(0, total));
-    } catch (err) {
-      logger.warn('[ChatService] refreshOsBadge failed:', err);
-    }
+    return new Promise<void>((resolve) => {
+      this.badgeRefreshResolvers.push(resolve);
+      if (this.badgeRefreshTimer) {
+        clearTimeout(this.badgeRefreshTimer);
+      }
+      this.badgeRefreshTimer = setTimeout(async () => {
+        this.badgeRefreshTimer = null;
+        const resolvers = this.badgeRefreshResolvers;
+        this.badgeRefreshResolvers = [];
+        try {
+          const total = useChatStore
+            .getState()
+            .allRooms.reduce((sum, r) => sum + (r.unreadCount ?? 0), 0);
+          const Notifications = require('expo-notifications');
+          await Notifications.setBadgeCountAsync(Math.max(0, total));
+        } catch (err) {
+          logger.warn('[ChatService] refreshOsBadge failed:', err);
+        }
+        for (const r of resolvers) r();
+      }, 50);
+    });
   }
 
   // ========================================

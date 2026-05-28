@@ -380,6 +380,7 @@ class DeviceService {
     const api = getDefaultApi();
     let pubkeySharedHandled = false;
 
+    try {
     while (!this.pollAborted.get(sessionId)) {
       if (Date.now() > deadline) {
         useDeviceStore.getState().setNewDeviceError('POLL_TIMEOUT');
@@ -435,6 +436,14 @@ class DeviceService {
         return;
       }
       await sleep(POLL_INTERVAL_MS);
+    }
+    } finally {
+      // M3: drop the abort flag for this session — without this the Map
+      // would accumulate `false` entries (one per pairing attempt) for
+      // the lifetime of the app, and a re-entry into the screen with the
+      // same sessionId (rare but possible after a hot reload) would
+      // observe a stale value.
+      this.pollAborted.delete(sessionId);
     }
   }
 
@@ -753,6 +762,26 @@ class DeviceService {
     const api = getDefaultApi();
     await api.revokeDevice(deviceId);
     useDeviceStore.getState().removeDevice(deviceId);
+
+    // M10: drop the libsignal session for our own linked device that we
+    // just revoked. Without this, the self-fanout loop in chat.encrypt
+    // would keep encrypting for a deviceId the server has cut off, until
+    // the next /keys/:userId refresh updates the cache. Symmetric with
+    // the peer-revoke handler in chat.service.onDeviceRevoked which
+    // already drops the libsignal session for revoked peer devices.
+    try {
+      const tokenPayload = await api.getTokenPayload();
+      const ownUserId = String(tokenPayload?.sub ?? '');
+      if (ownUserId) {
+        await SignalProtocol.deleteRemoteSession(ownUserId, deviceId);
+        logger.info(`[DeviceService] revokeDevice: dropped native session for self/${deviceId}`);
+      }
+    } catch (err: any) {
+      logger.warn(
+        '[DeviceService] revokeDevice: deleteRemoteSession failed (non-fatal):',
+        err?.message ?? err,
+      );
+    }
   }
 }
 

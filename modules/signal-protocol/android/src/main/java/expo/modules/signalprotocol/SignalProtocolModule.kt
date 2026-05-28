@@ -37,14 +37,19 @@ class SignalProtocolModule : Module() {
     // M-10 FIX: ConcurrentHashMap for defensive thread safety.
     //
     // Multi-device (ADR-0001 D4): the map is keyed by `(userId, deviceId)`
-    // so we hold a distinct session per peer device. Encoding is
-    // `"<userId>/<deviceId>"`. Use `sessionKey()` to compose, and
-    // `getEncryptedSession()` / `putEncryptedSession()` / `removeEncryptedSession()`
-    // for type-safe access. The legacy `encryptedSessions[userId]` access
-    // pattern is gone — every call site must now know the deviceId
-    // (default 1 for backward-compat with single-device peers).
+    // so we hold a distinct session per peer device. The encoding uses the
+    // ASCII Unit Separator (U+001F) — a control character that cannot
+    // legitimately appear inside a userId — so the encoding round-trips
+    // unambiguously even if a userId contained `/` or `:` characters.
+    // The encoding is in-memory only (never persisted), so changing the
+    // separator does not break any stored state. Use `sessionKey()` to
+    // compose, and `getEncryptedSession()` / `putEncryptedSession()` /
+    // `removeEncryptedSession()` for type-safe access. The legacy
+    // `encryptedSessions[userId]` access pattern is gone — every call site
+    // must now know the deviceId (default 1 for backward-compat with
+    // single-device peers).
     private val encryptedSessions = java.util.concurrent.ConcurrentHashMap<String, EncryptedSession>()
-    private fun sessionKey(userId: String, deviceId: Int = 1): String = "$userId/$deviceId"
+    private fun sessionKey(userId: String, deviceId: Int = 1): String = "$userId$deviceId"
     private fun getEncryptedSession(userId: String, deviceId: Int = 1): EncryptedSession? =
         encryptedSessions[sessionKey(userId, deviceId)]
     private fun putEncryptedSession(userId: String, deviceId: Int = 1, session: EncryptedSession) {
@@ -282,7 +287,11 @@ class SignalProtocolModule : Module() {
         senderPublicKey: String
     ): ByteArray {
         val envelope = Base64.decode(ciphertextBase64, Base64.NO_WRAP)
-        if (envelope.size <= 1 + 12 + 16) {
+        // 1 byte version + 12 byte IV + ≥1 byte ciphertext + 16 byte tag.
+        // The `< 30` form is equivalent to the previous `<= 29` but makes
+        // the "ciphertext must be non-empty" intent obvious — a 29-byte
+        // envelope with an empty ciphertext would decrypt to nothing useful.
+        if (envelope.size < 1 + 12 + 1 + 16) {
             throw Exception("Provisioning ciphertext too short")
         }
         if (envelope[0].toInt() != 0x01) {
@@ -836,54 +845,66 @@ class SignalProtocolModule : Module() {
             // installing the identity. Used by the new device to compute the
             // pairing safety number and show it to the user before committing
             // anything to persistent state.
+            //
+            // M4: explicit buffer wipe on every exit path. The decrypted
+            // plaintext carries the primary's identity private key in serialized
+            // form, and `serializedBytes` is the base64-decoded copy passed
+            // into IdentityKeyPair. Both ByteArrays are zeroed in `finally`
+            // so they don't linger in the heap waiting for the next GC sweep —
+            // defense-in-depth against crash dumps / memory disclosure.
             val plaintextBytes = decryptProvisioningEnvelope(ciphertextBase64, recipientPrivateKey, senderPublicKey)
-            val plaintextString = String(plaintextBytes, Charsets.UTF_8)
-            val parsed = try {
-                org.json.JSONObject(plaintextString)
-            } catch (e: Exception) {
-                throw Exception("Provisioning payload is not valid JSON")
-            }
+            try {
+                val plaintextString = String(plaintextBytes, Charsets.UTF_8)
+                val parsed = try {
+                    org.json.JSONObject(plaintextString)
+                } catch (e: Exception) {
+                    throw Exception("Provisioning payload is not valid JSON")
+                }
 
-            val version = parsed.optInt("v", -1)
-            if (version != 1) {
-                throw Exception("Unsupported provisioning payload version")
-            }
-            val serializedB64 = parsed.optString("identityKeySerialized", "")
-            val identityPubB64 = parsed.optString("identityKeyPub", "")
-            val primaryUserId = parsed.optString("primaryUserId", "")
-            if (serializedB64.isEmpty() || identityPubB64.isEmpty() || primaryUserId.isEmpty()) {
-                throw Exception("Provisioning payload missing required fields")
-            }
+                val version = parsed.optInt("v", -1)
+                if (version != 1) {
+                    throw Exception("Unsupported provisioning payload version")
+                }
+                val serializedB64 = parsed.optString("identityKeySerialized", "")
+                val identityPubB64 = parsed.optString("identityKeyPub", "")
+                val primaryUserId = parsed.optString("primaryUserId", "")
+                if (serializedB64.isEmpty() || identityPubB64.isEmpty() || primaryUserId.isEmpty()) {
+                    throw Exception("Provisioning payload missing required fields")
+                }
 
-            // Integrity check: identityKeyPub must equal the public half of
-            // the deserialized keypair. Catches a tampered payload here, BEFORE
-            // we hand the resulting safety number to the user. Compared in
-            // constant time so a server-side attacker cannot mount a timing
-            // side-channel against the trusted identityKeyPub.
-            val serializedBytes = Base64.decode(serializedB64, Base64.NO_WRAP)
-            val importedIdentity = IdentityKeyPair(serializedBytes)
-            val recoveredPubBytes = importedIdentity.publicKey.serialize()
-            val claimedPubBytes = try {
-                Base64.decode(identityPubB64, Base64.NO_WRAP)
-            } catch (e: Exception) {
-                throw Exception("Provisioning payload integrity check failed: invalid identityKeyPub encoding")
-            }
-            if (!constantTimeEquals(recoveredPubBytes, claimedPubBytes)) {
-                throw Exception("Provisioning payload integrity check failed: identityKeyPub does not match identityKeySerialized")
-            }
+                // Integrity check: identityKeyPub must equal the public half of
+                // the deserialized keypair. Catches a tampered payload here, BEFORE
+                // we hand the resulting safety number to the user. Compared in
+                // constant time so a server-side attacker cannot mount a timing
+                // side-channel against the trusted identityKeyPub.
+                val serializedBytes = Base64.decode(serializedB64, Base64.NO_WRAP)
+                try {
+                    val importedIdentity = IdentityKeyPair(serializedBytes)
+                    val recoveredPubBytes = importedIdentity.publicKey.serialize()
+                    val claimedPubBytes = try {
+                        Base64.decode(identityPubB64, Base64.NO_WRAP)
+                    } catch (e: Exception) {
+                        throw Exception("Provisioning payload integrity check failed: invalid identityKeyPub encoding")
+                    }
+                    if (!constantTimeEquals(recoveredPubBytes, claimedPubBytes)) {
+                        throw Exception("Provisioning payload integrity check failed: identityKeyPub does not match identityKeySerialized")
+                    }
 
-            // `importedIdentity` and `serializedBytes` go out of scope here —
-            // the JVM GC will reclaim them. The private key is never persisted
-            // or returned to the JS layer.
-            val result = mutableMapOf<String, Any>(
-                "primaryUserId" to primaryUserId,
-                "identityKeyPub" to identityPubB64
-            )
-            val primaryName = parsed.optString("primaryName", "")
-            if (primaryName.isNotEmpty()) {
-                result["primaryName"] = primaryName
+                    val result = mutableMapOf<String, Any>(
+                        "primaryUserId" to primaryUserId,
+                        "identityKeyPub" to identityPubB64
+                    )
+                    val primaryName = parsed.optString("primaryName", "")
+                    if (primaryName.isNotEmpty()) {
+                        result["primaryName"] = primaryName
+                    }
+                    return@AsyncFunction result
+                } finally {
+                    java.util.Arrays.fill(serializedBytes, 0.toByte())
+                }
+            } finally {
+                java.util.Arrays.fill(plaintextBytes, 0.toByte())
             }
-            return@AsyncFunction result
         }
 
         AsyncFunction("consumeProvisioningPayload") {
@@ -893,42 +914,54 @@ class SignalProtocolModule : Module() {
                 throw Exception("Must authenticate before installing a provisioned identity")
             }
 
+            // M4: same wipe pattern as peekProvisioningPayload — zero the
+            // intermediate plaintext + base64-decoded serialized buffers on
+            // every exit path so they don't linger in heap memory between
+            // the install completing and the next GC sweep.
             val plaintextBytes = decryptProvisioningEnvelope(ciphertextBase64, recipientPrivateKey, senderPublicKey)
-            val plaintextString = String(plaintextBytes, Charsets.UTF_8)
-            val parsed = try {
-                org.json.JSONObject(plaintextString)
-            } catch (e: Exception) {
-                throw Exception("Provisioning payload is not valid JSON")
-            }
+            try {
+                val plaintextString = String(plaintextBytes, Charsets.UTF_8)
+                val parsed = try {
+                    org.json.JSONObject(plaintextString)
+                } catch (e: Exception) {
+                    throw Exception("Provisioning payload is not valid JSON")
+                }
 
-            val version = parsed.optInt("v", -1)
-            if (version != 1) {
-                throw Exception("Unsupported provisioning payload version")
-            }
-            val serializedB64 = parsed.optString("identityKeySerialized", "")
-            val identityPubB64 = parsed.optString("identityKeyPub", "")
-            if (serializedB64.isEmpty() || identityPubB64.isEmpty()) {
-                throw Exception("Provisioning payload missing required fields")
-            }
-            val serializedBytes = Base64.decode(serializedB64, Base64.NO_WRAP)
-            val importedIdentity = IdentityKeyPair(serializedBytes)
+                val version = parsed.optInt("v", -1)
+                if (version != 1) {
+                    throw Exception("Unsupported provisioning payload version")
+                }
+                val serializedB64 = parsed.optString("identityKeySerialized", "")
+                val identityPubB64 = parsed.optString("identityKeyPub", "")
+                if (serializedB64.isEmpty() || identityPubB64.isEmpty()) {
+                    throw Exception("Provisioning payload missing required fields")
+                }
+                val serializedBytes = Base64.decode(serializedB64, Base64.NO_WRAP)
+                try {
+                    val importedIdentity = IdentityKeyPair(serializedBytes)
 
-            // Cross-check: the embedded identityKeyPub MUST match the public
-            // key we recover from the serialized keypair. Detects a malformed
-            // or tampered payload before it reaches the Keystore. Compared in
-            // constant time so a server-side attacker cannot mount a timing
-            // side-channel against the trusted identityKeyPub.
-            val recoveredPubBytes = importedIdentity.publicKey.serialize()
-            val claimedPubBytes = try {
-                Base64.decode(identityPubB64, Base64.NO_WRAP)
-            } catch (e: Exception) {
-                throw Exception("Provisioning payload integrity check failed: invalid identityKeyPub encoding")
-            }
-            if (!constantTimeEquals(recoveredPubBytes, claimedPubBytes)) {
-                throw Exception("Provisioning payload integrity check failed: identityKeyPub does not match identityKeySerialized")
-            }
+                    // Cross-check: the embedded identityKeyPub MUST match the public
+                    // key we recover from the serialized keypair. Detects a malformed
+                    // or tampered payload before it reaches the Keystore. Compared in
+                    // constant time so a server-side attacker cannot mount a timing
+                    // side-channel against the trusted identityKeyPub.
+                    val recoveredPubBytes = importedIdentity.publicKey.serialize()
+                    val claimedPubBytes = try {
+                        Base64.decode(identityPubB64, Base64.NO_WRAP)
+                    } catch (e: Exception) {
+                        throw Exception("Provisioning payload integrity check failed: invalid identityKeyPub encoding")
+                    }
+                    if (!constantTimeEquals(recoveredPubBytes, claimedPubBytes)) {
+                        throw Exception("Provisioning payload integrity check failed: identityKeyPub does not match identityKeySerialized")
+                    }
 
-            return@AsyncFunction performIdentitySetup(deviceId, name, importedIdentity)
+                    return@AsyncFunction performIdentitySetup(deviceId, name, importedIdentity)
+                } finally {
+                    java.util.Arrays.fill(serializedBytes, 0.toByte())
+                }
+            } finally {
+                java.util.Arrays.fill(plaintextBytes, 0.toByte())
+            }
         }
 
         AsyncFunction("getPairingSafetyNumber") {

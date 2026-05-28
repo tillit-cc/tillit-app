@@ -31,14 +31,19 @@ public class SignalProtocolModule: Module {
     // M-10 FIX: Thread-safe accessors for encryptedSessions.
     //
     // Multi-device (ADR-0001 D4): the map is keyed by `(userId, deviceId)`
-    // so we hold a distinct session per peer device. The encoding is
-    // `"<userId>/<deviceId>"`. `deviceId` defaults to 1 to keep the
-    // legacy single-device call sites working unchanged — every caller
-    // that has a real deviceId available (from the message envelope,
+    // so we hold a distinct session per peer device. The encoding uses the
+    // ASCII Unit Separator (U+001F) — a control character that cannot
+    // legitimately appear inside a userId — so the encoding round-trips
+    // unambiguously even if a userId contained `/` or `:` characters.
+    // The encoding is in-memory only (never persisted), so changing the
+    // separator does not break any stored state. `deviceId` defaults to 1
+    // to keep the legacy single-device call sites working unchanged —
+    // every caller that has a real deviceId available (message envelope,
     // resumeSession args, /keys/:userId response, etc.) should pass it
     // explicitly so multi-device peers get their own session slot.
+    private static let sessionKeySeparator: Character = "\u{001F}"
     private static func sessionKey(_ userId: String, _ deviceId: UInt32) -> String {
-        return "\(userId)/\(deviceId)"
+        return "\(userId)\(Self.sessionKeySeparator)\(deviceId)"
     }
     private func getSession(_ userId: String, _ deviceId: UInt32 = 1) -> EncryptedSession? {
         sessionsQueue.sync { encryptedSessions[Self.sessionKey(userId, deviceId)] }
@@ -266,7 +271,11 @@ public class SignalProtocolModule: Module {
         guard let envelope = Data(base64Encoded: ciphertextBase64) else {
             throw NSError(domain: "SignalProtocol", code: 400, userInfo: [NSLocalizedDescriptionKey: "Invalid base64 ciphertext"])
         }
-        guard envelope.count > 1 + 12 + 16 else {
+        // 1 byte version + 12 byte IV + ≥1 byte ciphertext + 16 byte tag.
+        // The `>= 30` form is equivalent to the previous `> 29` but makes
+        // the "ciphertext must be non-empty" intent obvious — a 29-byte
+        // envelope with an empty ciphertext would decrypt to nothing useful.
+        guard envelope.count >= 1 + 12 + 1 + 16 else {
             throw NSError(domain: "SignalProtocol", code: 400, userInfo: [NSLocalizedDescriptionKey: "Provisioning ciphertext too short"])
         }
         guard envelope[envelope.startIndex] == 0x01 else {
@@ -919,11 +928,19 @@ public class SignalProtocolModule: Module {
             // installing the identity. Used by the new device to compute the
             // pairing safety number and show it to the user before committing
             // anything to persistent state.
-            let plaintext = try self.decryptProvisioningEnvelope(
+            //
+            // M4: explicit buffer wipe on every exit path. ARC alone leaves
+            // the decrypted plaintext (which contains the primary's identity
+            // private key in serialized form) in heap memory until the next
+            // GC sweep. `defer` + `resetBytes(in:)` zero it before the function
+            // returns — defense-in-depth against crash dumps or memory
+            // disclosure between use and reclamation.
+            var plaintext = try self.decryptProvisioningEnvelope(
                 ciphertextBase64: ciphertextBase64,
                 recipientPrivateKey: recipientPrivateKey,
                 senderPublicKey: senderPublicKey
             )
+            defer { plaintext.resetBytes(in: 0..<plaintext.count) }
 
             guard let parsed = try? JSONSerialization.jsonObject(with: plaintext, options: []) as? [String: Any] else {
                 throw NSError(domain: "SignalProtocol", code: 400, userInfo: [NSLocalizedDescriptionKey: "Provisioning payload is not valid JSON"])
@@ -934,9 +951,10 @@ public class SignalProtocolModule: Module {
             guard let serializedB64 = parsed["identityKeySerialized"] as? String,
                   let identityPubB64 = parsed["identityKeyPub"] as? String,
                   let primaryUserId = parsed["primaryUserId"] as? String,
-                  let serializedData = Data(base64Encoded: serializedB64) else {
+                  var serializedData = Data(base64Encoded: serializedB64) else {
                 throw NSError(domain: "SignalProtocol", code: 400, userInfo: [NSLocalizedDescriptionKey: "Provisioning payload missing required fields"])
             }
+            defer { serializedData.resetBytes(in: 0..<serializedData.count) }
 
             // Integrity check: identityKeyPub must equal the public half of
             // the deserialized keypair. Catches a tampered payload here, BEFORE
@@ -969,11 +987,17 @@ public class SignalProtocolModule: Module {
                 throw NSError(domain: "SignalProtocol", code: 401, userInfo: [NSLocalizedDescriptionKey: "Must authenticate before installing a provisioned identity"])
             }
 
-            let plaintext = try self.decryptProvisioningEnvelope(
+            // M4: explicit buffer wipe — see the matching block in
+            // peekProvisioningPayload for the rationale. Even when the
+            // identity is committed to the Keychain successfully, the
+            // intermediate `plaintext` + base64-decoded `serializedData`
+            // copies must not linger in the heap.
+            var plaintext = try self.decryptProvisioningEnvelope(
                 ciphertextBase64: ciphertextBase64,
                 recipientPrivateKey: recipientPrivateKey,
                 senderPublicKey: senderPublicKey
             )
+            defer { plaintext.resetBytes(in: 0..<plaintext.count) }
 
             guard let parsed = try? JSONSerialization.jsonObject(with: plaintext, options: []) as? [String: Any] else {
                 throw NSError(domain: "SignalProtocol", code: 400, userInfo: [NSLocalizedDescriptionKey: "Provisioning payload is not valid JSON"])
@@ -983,9 +1007,10 @@ public class SignalProtocolModule: Module {
             }
             guard let serializedB64 = parsed["identityKeySerialized"] as? String,
                   let identityPubB64 = parsed["identityKeyPub"] as? String,
-                  let serializedData = Data(base64Encoded: serializedB64) else {
+                  var serializedData = Data(base64Encoded: serializedB64) else {
                 throw NSError(domain: "SignalProtocol", code: 400, userInfo: [NSLocalizedDescriptionKey: "Provisioning payload missing required fields"])
             }
+            defer { serializedData.resetBytes(in: 0..<serializedData.count) }
 
             let importedIdentity = try IdentityKeyPair(bytes: Array(serializedData))
 

@@ -145,7 +145,14 @@ function base64urlToBase64(b64url: string): string {
   const pad = s.length % 4;
   if (pad === 2) s += '==';
   else if (pad === 3) s += '=';
-  else if (pad === 1) return ''; // invalid length
+  else if (pad === 1) {
+    // pad === 1 is structurally impossible for valid base64url — surface
+    // loudly so a malformed `e` / `s` parameter in the QR string shows up
+    // in the logs instead of just silently falling out at the empty-string
+    // check in the caller.
+    logger.warn('[ProvisioningLink] base64url with invalid length (pad===1) len=' + b64url.length);
+    return '';
+  }
   return s;
 }
 
