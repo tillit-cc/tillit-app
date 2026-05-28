@@ -35,7 +35,7 @@ import { Message, NewMessage } from '@/db/schema';
 import { generateUUID, generateLocalId } from '@/types/message';
 import {PAGE_SIZE, PRIMARY_DEVICE_ID, SENDER_KEY_THRESHOLD, TYPING_THROTTLE_MS} from '@/config/app.config';
 import { logger } from '@/utils/logger';
-import { generateThumbnailFromBase64, generateColorPreviewFromBase64, saveImageToFile, deleteImagesByMessageIds, readImageAsBase64 } from '@/utils/image';
+import { generateThumbnailFromBase64, generateMicroThumbnailFromBase64, generateColorPreviewFromBase64, saveImageToFile, deleteImagesByMessageIds, readImageAsBase64 } from '@/utils/image';
 import { readFileAsBase64, saveFileToCache, deleteFilesByMessageIds, fileExists, resolveFilePath, MAX_FILE_SIZE } from '@/utils/file';
 import { toLocalRoomId, toBackendRoomId, getServerIdFromRoomId } from '@/utils/server-id';
 
@@ -559,6 +559,23 @@ class ChatService {
     const ownDeviceId = useAuthStore.getState().deviceId ?? PRIMARY_DEVICE_ID;
     // Also check server-specific user ID (different per server)
     const serverUserId = serverRegistry.getUserIdForRoom(envelope.id_room);
+
+    // A6: normalize device_id_from at the boundary. Legacy envelopes queued
+    // in pending_messages and some backend code paths can deliver this as
+    // a string (e.g. "1" instead of 1). The self-fanout echo filter below
+    // gates on `typeof === 'number'` and would let a stringified own-device
+    // echo through; downstream native calls expect a number. Coerce once
+    // here so every consumer downstream is guaranteed `number | undefined`,
+    // without each call site re-running the same defensive guard.
+    const rawDeviceIdFrom = (envelope as any).device_id_from;
+    if (rawDeviceIdFrom != null && typeof rawDeviceIdFrom !== 'number') {
+      const coerced = Number(rawDeviceIdFrom);
+      if (Number.isFinite(coerced) && coerced > 0) {
+        envelope.device_id_from = coerced;
+      } else {
+        delete envelope.device_id_from;
+      }
+    }
 
     // Multi-device: a message with `id_user_from === self` may come from
     // ANOTHER linked device of ours (self-fan-out copy — see the self-fanout
@@ -1339,6 +1356,8 @@ class ChatService {
       const cached = sessionService.getRemoteDeviceIds(remoteUserId);
       const deviceIds = cached.length > 0 ? cached : [PRIMARY_DEVICE_ID];
 
+      const peerStartCount = recipients.length;
+
       for (const deviceId of deviceIds) {
         // Lazy per-device session establishment: the deviceMap may include a
         // device the peer linked AFTER our original session was set up, so
@@ -1380,6 +1399,52 @@ class ChatService {
             throw encError;
           }
         }
+      }
+
+      // A4: failover — if the cached device list yielded ZERO recipients
+      // for this peer (every per-device session failed AND the cache did
+      // not include PRIMARY_DEVICE_ID), try the primary explicitly. This
+      // covers the edge case where the cache is stale on revoked secondaries
+      // and the peer is actually reachable only on the primary, which would
+      // otherwise be silently skipped.
+      if (recipients.length === peerStartCount && !deviceIds.includes(PRIMARY_DEVICE_ID)) {
+        logger.warn(
+          `[ChatService] encrypt: 0 recipients for ${remoteUserId} from cached devices [${deviceIds.join(',')}] — attempting PRIMARY failover`,
+        );
+        const primaryReady = await sessionService.ensureSessionForRemotePeerDevice(
+          roomId,
+          remoteUserId,
+          PRIMARY_DEVICE_ID,
+        );
+        if (primaryReady) {
+          try {
+            const { encryptedMessage } = await SignalProtocol.encryptMessage(
+              encodeURIComponent(message),
+              remoteUserId,
+              PRIMARY_DEVICE_ID,
+            );
+            recipients.push({
+              userId: Number(remoteUserId),
+              deviceId: PRIMARY_DEVICE_ID,
+              ciphertext: encryptedMessage,
+            });
+            logger.info(`[ChatService] encrypt: PRIMARY failover succeeded for ${remoteUserId}`);
+          } catch (failoverErr) {
+            logger.error(
+              `[ChatService] encrypt: PRIMARY failover encrypt failed for ${remoteUserId}:`,
+              failoverErr,
+            );
+          }
+        }
+      }
+
+      if (recipients.length === peerStartCount) {
+        // Even the failover gave up. Don't fail the entire send — other peers
+        // may still get the message — but make the silent drop loud in logs
+        // so we can correlate with "missing message" reports from the field.
+        logger.warn(
+          `[ChatService] encrypt: peer ${remoteUserId} unreachable (no device produced a ciphertext); message will not be delivered to this peer`,
+        );
       }
     }
 
@@ -1767,7 +1832,10 @@ class ChatService {
     }
     await messageRepository.create(message);
 
-    // 2. Generate thumbnail (large for local UI, micro for WS payload)
+    // 2. Generate thumbnails: large (local UI only, store/DB) + micro (WS payload).
+    // The micro-thumbnail keeps the reference message under the backend's 64KB
+    // WS limit (amplified by per-device fan-out); the large one never leaves the
+    // device — the bubble reads it from store/DB.
     if (!imagePayload.thumbnail) {
       try {
         const thumbnail = await generateThumbnailFromBase64(
@@ -1778,6 +1846,16 @@ class ChatService {
       } catch (error) {
         logger.warn('[ChatService] Persistent: thumbnail generation failed:', error);
       }
+    }
+
+    let microThumbnail = '';
+    try {
+      microThumbnail = await generateMicroThumbnailFromBase64(
+        imagePayload.base64,
+        imagePayload.mimeType
+      );
+    } catch (error) {
+      logger.warn('[ChatService] Persistent: micro-thumbnail generation failed:', error);
     }
 
     // 3. Save original image to filesystem
@@ -1815,7 +1893,9 @@ class ChatService {
           mediaId: uploadResult.mediaId,
           mediaKey: keyBase64,
           iv: ivBase64,
-          thumbnail: imagePayload.thumbnail || '',
+          // WS payload carries only the micro-thumbnail (~<3KB) to stay under the
+          // backend's 64KB limit; the large thumbnail lives in store/DB (step 4).
+          thumbnail: microThumbnail,
           mimeType: imagePayload.mimeType || 'image/jpeg',
           width: imagePayload.width || 0,
           height: imagePayload.height || 0,

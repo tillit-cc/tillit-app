@@ -91,6 +91,22 @@ class DeviceService {
     { resolve: () => void; reject: (err: Error) => void }
   >();
 
+  /**
+   * Release any pending `confirmNewDeviceSafetyAndInstall` waiter for the
+   * given session with the supplied error. Idempotent — safe to call from
+   * every poll-loop exit path (timeout, 404, 410, server-reported expired)
+   * as well as cancellation. Without this, exiting `pollNewDeviceSessionResult`
+   * with the user already past Match would leave the install promise
+   * pending forever (memory leak + the UI never gets a verdict).
+   */
+  private rejectPayloadWaiter(sessionId: string | null | undefined, err: Error): void {
+    if (!sessionId) return;
+    const waiter = this.payloadArrivalResolvers.get(sessionId);
+    if (!waiter) return;
+    this.payloadArrivalResolvers.delete(sessionId);
+    waiter.reject(err);
+  }
+
   // ===================== PRIMARY SIDE (scanner) =====================
 
   /**
@@ -367,6 +383,7 @@ class DeviceService {
     while (!this.pollAborted.get(sessionId)) {
       if (Date.now() > deadline) {
         useDeviceStore.getState().setNewDeviceError('POLL_TIMEOUT');
+        this.rejectPayloadWaiter(sessionId, new Error('POLL_TIMEOUT'));
         return;
       }
       let res: LinkSessionResultResponse;
@@ -376,10 +393,12 @@ class DeviceService {
         const status = err?.response?.status;
         if (status === 404) {
           useDeviceStore.getState().setNewDeviceError('SESSION_NOT_FOUND');
+          this.rejectPayloadWaiter(sessionId, new Error('SESSION_NOT_FOUND'));
           return;
         }
         if (status === 410) {
           useDeviceStore.getState().setNewDeviceError('SESSION_EXPIRED');
+          this.rejectPayloadWaiter(sessionId, new Error('SESSION_EXPIRED'));
           return;
         }
         logger.warn('[DeviceService] linkSessionResult poll error:', err?.message ?? err);
@@ -388,6 +407,7 @@ class DeviceService {
       }
       if (res.status === 'expired') {
         useDeviceStore.getState().setNewDeviceError('SESSION_EXPIRED');
+        this.rejectPayloadWaiter(sessionId, new Error('SESSION_EXPIRED'));
         return;
       }
       if (
@@ -497,26 +517,27 @@ class DeviceService {
         res.primaryEphemeralPublicKey,
       );
 
-      // Anti-tamper: the identityKeyPub the server fed us in
-      // `pubkey-shared` MUST equal the one inside the just-decrypted
-      // payload. A divergence means the server swapped one of the two —
-      // abort hard, do NOT install. (If `identityKeyPubFromShare` is
-      // null we never went through pubkey-shared and the server might
-      // have skipped the wire v2.1 path; in that case the safety check
-      // degrades to "what's in the payload" and we accept it.)
+      // Anti-tamper (wire v2.1): the identityKeyPub the server fed us in
+      // `pubkey-shared` MUST be present AND equal to the one inside the
+      // just-decrypted payload. The wire v2.1 guarantee is "MITM detected
+      // pre-commit"; silently accepting `null` from a server that skipped
+      // the share step would downgrade us to "trust whatever the payload
+      // says", which is exactly what the share step exists to prevent.
+      // So either branch is a hard abort, with a distinct error code so
+      // the UI can tell missing infrastructure (PUBKEY_SHARED_MISSING)
+      // from active tampering (IDENTITY_KEY_TAMPERED).
       if (
-        pairing.identityKeyPubFromShare &&
+        !pairing.identityKeyPubFromShare ||
         pairing.identityKeyPubFromShare !== peek.identityKeyPub
       ) {
+        const reason = pairing.identityKeyPubFromShare
+          ? 'IDENTITY_KEY_TAMPERED'
+          : 'PUBKEY_SHARED_MISSING';
         logger.error(
-          '[DeviceService] identityKeyPub mismatch between share and complete — possible server tamper',
+          `[DeviceService] anti-tamper abort: ${reason} (have share=${!!pairing.identityKeyPubFromShare})`,
         );
-        store.setNewDeviceError('IDENTITY_KEY_TAMPERED');
-        const waiter = this.payloadArrivalResolvers.get(pairing.sessionId ?? '');
-        if (waiter && pairing.sessionId) {
-          this.payloadArrivalResolvers.delete(pairing.sessionId);
-          waiter.reject(new Error('IDENTITY_KEY_TAMPERED'));
-        }
+        store.setNewDeviceError(reason);
+        this.rejectPayloadWaiter(pairing.sessionId, new Error(reason));
         return;
       }
 
@@ -554,13 +575,10 @@ class DeviceService {
       logger.error('[DeviceService] onCompletedReady failed:', err?.message ?? err);
       store.setNewDeviceError('PEEK_FAILED');
       // Unblock any waiter so the UI promise doesn't hang.
-      if (pairing.sessionId) {
-        const waiter = this.payloadArrivalResolvers.get(pairing.sessionId);
-        if (waiter) {
-          this.payloadArrivalResolvers.delete(pairing.sessionId);
-          waiter.reject(err instanceof Error ? err : new Error(String(err)));
-        }
-      }
+      this.rejectPayloadWaiter(
+        pairing.sessionId,
+        err instanceof Error ? err : new Error(String(err)),
+      );
     }
   }
 
@@ -627,6 +645,33 @@ class DeviceService {
         deviceName,
       );
       logger.info('[DeviceService] identity installed, deviceId:', bundle.deviceId);
+
+      // Defense-in-depth: the deviceId on the freshly-installed bundle MUST
+      // match the one assigned by the server. We pass it INTO the native
+      // call, so under normal conditions this is a tautology — but if the
+      // native module ever ignores the parameter (regression) or the chain
+      // is tampered with (we passed X, native installed Y), authenticating
+      // later as the "wrong" deviceId would leave us in a state where the
+      // server thinks one device is online but the keypair is bound to a
+      // different slot. Wipe the just-installed identity and refuse to
+      // proceed so the user gets a clean re-pair attempt.
+      if (Number(bundle.deviceId) !== pairing.assignedDeviceId) {
+        logger.error(
+          '[DeviceService] assignedDeviceId mismatch — wiping freshly installed identity:',
+          { server: pairing.assignedDeviceId, native: bundle.deviceId },
+        );
+        try {
+          await SignalProtocol.clearIdentity();
+        } catch (wipeErr: any) {
+          logger.warn(
+            '[DeviceService] clearIdentity after mismatch failed (non-fatal):',
+            wipeErr?.message ?? wipeErr,
+          );
+        }
+        store.setNewDeviceError('ASSIGNED_DEVICE_ID_MISMATCH');
+        throw new Error('ASSIGNED_DEVICE_ID_MISMATCH');
+      }
+
       // The store moves to `done` only after the caller finishes the
       // server-side publish + authenticate flow. We do not flip the phase
       // here because the UI still needs to drive auth before the user can
@@ -634,7 +679,11 @@ class DeviceService {
       return { assignedDeviceId: pairing.assignedDeviceId };
     } catch (err: any) {
       logger.error('[DeviceService] confirmNewDeviceSafetyAndInstall failed:', err?.message ?? err);
-      store.setNewDeviceError('INSTALL_FAILED');
+      // Don't overwrite a more specific error code we already set above
+      // (e.g. ASSIGNED_DEVICE_ID_MISMATCH).
+      if (useDeviceStore.getState().pairingNewDevice?.phase !== 'error') {
+        store.setNewDeviceError('INSTALL_FAILED');
+      }
       throw err;
     }
   }
@@ -654,11 +703,7 @@ class DeviceService {
       this.pollAborted.set(pairing.sessionId, true);
       // Release any in-flight `confirmNewDeviceSafetyAndInstall` waiter
       // so the UI's install promise rejects cleanly on user abort.
-      const waiter = this.payloadArrivalResolvers.get(pairing.sessionId);
-      if (waiter) {
-        this.payloadArrivalResolvers.delete(pairing.sessionId);
-        waiter.reject(new Error('CANCELLED'));
-      }
+      this.rejectPayloadWaiter(pairing.sessionId, new Error('CANCELLED'));
     }
     // Best-effort server-side rollback: only meaningful once /complete
     // has assigned a deviceId. In wire v2.1 the user can press
