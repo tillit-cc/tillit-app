@@ -298,6 +298,7 @@ export default {
     errorAlreadyConsumed: 'This QR has already been used to link a device. Generate a new QR and try again.',
     errorPubkeySharedMissing: 'The server did not complete the protocol\'s required safety step. Operation cancelled — try again with a fresh QR.',
     errorAssignedDeviceIdMismatch: 'Internal install error (inconsistent deviceId). Identity wiped — try linking the device again.',
+    errorIdentityWipeFailed: 'Critical install error: the temporary identity could not be removed from this device. Reinstall the app (or clear its data) before linking this device again.',
     errorGeneric: 'An error occurred. Please try again.',
     errorInvalidQR: 'Invalid QR. Scan a TilliT code.',
   },

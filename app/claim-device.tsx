@@ -192,6 +192,8 @@ export default function ClaimDeviceScreen() {
         return t('linkedDevices.errorPubkeySharedMissing');
       case 'ASSIGNED_DEVICE_ID_MISMATCH':
         return t('linkedDevices.errorAssignedDeviceIdMismatch');
+      case 'IDENTITY_WIPE_FAILED':
+        return t('linkedDevices.errorIdentityWipeFailed');
       default:
         return t('linkedDevices.errorGeneric');
     }

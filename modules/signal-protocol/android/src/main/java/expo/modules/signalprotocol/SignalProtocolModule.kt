@@ -49,7 +49,7 @@ class SignalProtocolModule : Module() {
     // must now know the deviceId (default 1 for backward-compat with
     // single-device peers).
     private val encryptedSessions = java.util.concurrent.ConcurrentHashMap<String, EncryptedSession>()
-    private fun sessionKey(userId: String, deviceId: Int = 1): String = "$userId$deviceId"
+    private fun sessionKey(userId: String, deviceId: Int = 1): String = "$userId\u001F$deviceId"
     private fun getEncryptedSession(userId: String, deviceId: Int = 1): EncryptedSession? =
         encryptedSessions[sessionKey(userId, deviceId)]
     private fun putEncryptedSession(userId: String, deviceId: Int = 1, session: EncryptedSession) {
@@ -98,8 +98,14 @@ class SignalProtocolModule : Module() {
         } catch (e: Throwable) {
             // Roll back to a clean state so the next attempt (or a future
             // `loadStoredLocalUser`) doesn't trip over half-installed material.
-            // Re-throws the original error so the caller sees the real cause.
-            resetIdentityState()
+            // The rollback must not mask the original cause: if it throws too
+            // (e.g. reactContext gone), attach it as suppressed and re-throw
+            // the real error.
+            try {
+                resetIdentityState()
+            } catch (rollbackErr: Throwable) {
+                e.addSuppressed(rollbackErr)
+            }
             throw e
         }
     }
@@ -241,7 +247,15 @@ class SignalProtocolModule : Module() {
     // cleanup makes the atomicity guarantee in `performIdentitySetup`
     // explicit: either every store ends up populated, or nothing remains.
     private fun resetIdentityState() {
-        val ctx = appContext.reactContext ?: return
+        // This is a security-critical wipe (rollback of a half-installed
+        // identity, or an explicit user wipe). Never skip it silently: without
+        // a reactContext we cannot reach protected storage, so surface the
+        // failure loudly instead of leaving key material behind. Callers in a
+        // rollback path attach this as suppressed so the original cause wins.
+        val ctx = appContext.reactContext
+            ?: throw IllegalStateException(
+                "resetIdentityState: reactContext unavailable — cannot wipe identity state"
+            )
         val keystoreHelper = KeystoreHelper.getInstance(ctx)
         keystoreHelper.clearAll()
         localUser = null

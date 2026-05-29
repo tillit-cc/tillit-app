@@ -687,13 +687,34 @@ class DeviceService {
           '[DeviceService] assignedDeviceId mismatch — wiping freshly installed identity:',
           { server: pairing.assignedDeviceId, native: bundle.deviceId },
         );
-        try {
-          await SignalProtocol.clearIdentity();
-        } catch (wipeErr: any) {
-          logger.warn(
-            '[DeviceService] clearIdentity after mismatch failed (non-fatal):',
-            wipeErr?.message ?? wipeErr,
+        // The wrong-slot identity is already committed to protected storage;
+        // it MUST be wiped, otherwise a later `loadStoredLocalUser` would
+        // resurrect it. Retry a few times before giving up — a swallowed
+        // failure here would defeat the whole point of this guard.
+        let wiped = false;
+        for (let attempt = 1; attempt <= 3 && !wiped; attempt++) {
+          try {
+            await SignalProtocol.clearIdentity();
+            wiped = true;
+          } catch (wipeErr: any) {
+            logger.warn(
+              `[DeviceService] clearIdentity after mismatch failed (attempt ${attempt}/3):`,
+              wipeErr?.message ?? wipeErr,
+            );
+            if (attempt < 3) await sleep(150);
+          }
+        }
+        if (!wiped) {
+          // The mismatched identity is still on the device. Do NOT surface the
+          // reassuring ASSIGNED_DEVICE_ID_MISMATCH code (its message says
+          // "identity wiped, try again") — escalate to a distinct fatal state
+          // so the UI can tell the user to reinstall / clear app data before
+          // re-pairing, instead of silently re-using the corrupt identity.
+          logger.error(
+            '[DeviceService] CRITICAL: could not wipe mismatched identity — manual reinstall required',
           );
+          store.setNewDeviceError('IDENTITY_WIPE_FAILED');
+          throw new Error('IDENTITY_WIPE_FAILED');
         }
         store.setNewDeviceError('ASSIGNED_DEVICE_ID_MISMATCH');
         throw new Error('ASSIGNED_DEVICE_ID_MISMATCH');
