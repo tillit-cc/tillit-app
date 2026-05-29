@@ -39,6 +39,154 @@ class SessionService {
   private lastRefreshTime = new Map<number, number>(); // per-server
   private readonly REFRESH_THROTTLE_MS = 60_000;
 
+  /**
+   * Multi-device awareness (ADR-0001 D4): `userId → Set<deviceId>` cache,
+   * refreshed every time we fetch `/keys/:userId` from the server. The
+   * fan-out send path in chat.service uses `getRemoteDeviceIds(userId)`
+   * to know how many copies of the same message to encrypt and to which
+   * `(userId, deviceId)` slots.
+   *
+   * Hydrated at boot from the `session.remote_known_devices` column
+   * (`loadSessions`) and refreshed lazily on every `/keys/:userId` fetch.
+   */
+  private deviceMap = new Map<string, Set<number>>();
+
+  /**
+   * Throttle for `refreshRemoteDeviceMap`: per-userId timestamp of the last
+   * `/keys/:userId` fetch that updated `deviceMap`. Used by the peer-sync
+   * path (`chat.service.syncRoomMembersAndSessions`) to avoid hammering the
+   * backend with one GET per peer per room on every reconnect.
+   */
+  private lastDeviceMapRefresh = new Map<string, number>();
+  private readonly DEVICE_MAP_REFRESH_THROTTLE_MS = 60_000;
+
+  /**
+   * Return the deviceIds the peer has published bundles for. Returns
+   * an empty array until the first /keys/:userId fetch has populated the
+   * cache. Callers can fall back to `[PRIMARY_DEVICE_ID]` when empty to
+   * preserve single-device behavior.
+   */
+  getRemoteDeviceIds(userId: string): number[] {
+    const set = this.deviceMap.get(String(userId));
+    return set ? Array.from(set) : [];
+  }
+
+  /**
+   * Replace the cached deviceIds for a user. Called from
+   * `fetchRemoteKeys` after a successful /keys/:userId response.
+   *
+   * Also persists the list onto every existing `session` row for the user
+   * (`remote_known_devices` CSV column). At boot, `loadSessions` re-hydrates
+   * `deviceMap` from those rows, so the fan-out send path doesn't fall back
+   * to `[PRIMARY_DEVICE_ID]` in the window between restart and the first
+   * `onConnected` sync.
+   */
+  private updateRemoteDeviceMap(userId: string, deviceIds: number[]): void {
+    const key = String(userId);
+    if (deviceIds.length === 0) {
+      this.deviceMap.delete(key);
+      // Don't wipe the persisted column on transient empty responses; keep
+      // the last known good list.
+      return;
+    }
+    this.deviceMap.set(key, new Set(deviceIds));
+    this.lastDeviceMapRefresh.set(key, Date.now());
+    // Best-effort persistence — never block the in-memory update on DB IO.
+    sessionRepository
+      .updateRemoteKnownDevicesForUser(key, deviceIds)
+      .catch((err) => logger.warn('[SessionService] persist deviceMap failed:', err));
+  }
+
+  /**
+   * Drop the cached deviceIds for a user. The next `getRemoteDeviceIds` will
+   * report an empty list and the next `encrypt` fan-out will trigger a fresh
+   * `/keys/:userId` via `refreshRemoteDeviceMap` (or fall back to
+   * `[PRIMARY_DEVICE_ID]` until then).
+   *
+   * Used by the peer-device-linked socket handler (frontend-0008 / Opzione 3)
+   * to react to backend-pushed cache invalidations.
+   */
+  invalidateRemoteDeviceMap(userId: string): void {
+    const key = String(userId);
+    this.deviceMap.delete(key);
+    this.lastDeviceMapRefresh.delete(key);
+    sessionRepository
+      .updateRemoteKnownDevicesForUser(key, [])
+      .catch((err) => logger.warn('[SessionService] invalidate deviceMap persist failed:', err));
+  }
+
+  /**
+   * Force-refresh the multi-device cache for a peer WITHOUT touching the
+   * libsignal session state. Used by the peer-sync path when we already
+   * have an established session but want to discover newly-linked devices
+   * the peer published since the last fetch.
+   *
+   * Throttled per-userId (60s by default) so calling this for every member
+   * of every room on each `onConnected` doesn't fan into N×M HTTP requests.
+   * Pass `force: true` to bypass the throttle (e.g. handler of an explicit
+   * `peerDeviceLinked` push notification).
+   */
+  async refreshRemoteDeviceMap(
+    roomId: number,
+    remoteUserId: string,
+    options: { force?: boolean } = {},
+  ): Promise<number[]> {
+    const key = String(remoteUserId);
+    const now = Date.now();
+    const last = this.lastDeviceMapRefresh.get(key) ?? 0;
+    if (!options.force && now - last < this.DEVICE_MAP_REFRESH_THROTTLE_MS) {
+      return this.getRemoteDeviceIds(key);
+    }
+
+    const api = this.getApiForRoom(roomId);
+    let remoteKeys: any;
+    try {
+      remoteKeys = await api.getRemoteKeys(key);
+    } catch (err) {
+      logger.warn('[SessionService] refreshRemoteDeviceMap fetch failed for', key, err);
+      return this.getRemoteDeviceIds(key);
+    }
+
+    const bundles = this.bundlesFromResponse(remoteKeys);
+    const deviceIds = bundles
+      .map((b) => Number(b.deviceId ?? PRIMARY_DEVICE_ID))
+      .filter((n) => Number.isFinite(n) && n > 0);
+
+    this.updateRemoteDeviceMap(key, deviceIds);
+    return deviceIds;
+  }
+
+  /**
+   * Normalize the response shape of `GET /keys/:userId` to an array of
+   * bundles. The backend may return `{ devices: [...] }` (multi-device,
+   * post backend-0004) or a single bundle (legacy / single-device). Both
+   * are accepted to keep the client robust across the transition.
+   */
+  private bundlesFromResponse(remoteKeys: any): any[] {
+    if (remoteKeys?.devices && Array.isArray(remoteKeys.devices) && remoteKeys.devices.length > 0) {
+      return remoteKeys.devices.map((b: any) => this.normalizeBundle(b));
+    }
+    if (remoteKeys && (remoteKeys.identityPublicKey || remoteKeys.identityKey || remoteKeys.signedPreKey)) {
+      return [this.normalizeBundle(remoteKeys)];
+    }
+    return [];
+  }
+
+  /**
+   * Normalize wire field renames between v1 (single-device) and v2
+   * (multi-device): the backend's `GET /keys/:userId` v2 shape renames
+   * `identityPublicKey` → `identityKey`. We keep both names on the
+   * normalized bundle so downstream code (which reads `identityPublicKey`)
+   * keeps working without further branching.
+   */
+  private normalizeBundle(bundle: any): any {
+    if (!bundle || typeof bundle !== 'object') return bundle;
+    if (!bundle.identityPublicKey && bundle.identityKey) {
+      return { ...bundle, identityPublicKey: bundle.identityKey };
+    }
+    return bundle;
+  }
+
   private getOwnUserId(): number | null {
     return useAuthStore.getState().userId;
   }
@@ -75,6 +223,16 @@ class SessionService {
 
     if (existingSession) {
       logger.info('[SessionService] Session already exists, resuming');
+      // Refresh the multi-device cache even when keeping the existing session
+      // — otherwise newly-linked peer devices published since the last fetch
+      // never enter the fan-out, and we keep encrypting only for the device
+      // list that was current at the original session establishment.
+      // Throttled per-userId so this is cheap when called for every peer on
+      // each `onConnected`.
+      this.refreshRemoteDeviceMap(roomId, remoteUserIdStr).catch(() => {
+        // Already logged inside refreshRemoteDeviceMap; never let a refresh
+        // failure block the resume path.
+      });
       try {
         await this.resumeSession(roomId, remoteUserIdStr, username, deviceId);
         return true;
@@ -103,12 +261,36 @@ class SessionService {
       return false;
     }
 
+    // Multi-device cache refresh (ADR-0001 D4). The legacy single-device
+    // path below continues with `remoteKeys` as a single bundle — if the
+    // server returned the `{ devices: [...] }` array shape, pick the
+    // bundle matching the deviceId we were asked to set up (default to
+    // the first one). Other devices' bundles surface to the fan-out
+    // send path via `getRemoteDeviceIds`.
+    const allBundles = this.bundlesFromResponse(remoteKeys);
+    const allDeviceIds = allBundles
+      .map((b) => Number(b.deviceId ?? PRIMARY_DEVICE_ID))
+      .filter((n) => Number.isFinite(n) && n > 0);
+    this.updateRemoteDeviceMap(remoteUserIdStr, allDeviceIds);
+    if (allBundles.length > 0) {
+      const requested = allBundles.find((b) => Number(b.deviceId) === Number(deviceId));
+      remoteKeys = requested ?? allBundles[0];
+    }
+
     const preKey = remoteKeys.preKey || null;
     const kyberPreKey = remoteKeys.kyberPreKey || null;
     const signedPreKey = remoteKeys.signedPreKey || null;
 
     if (!preKey || !kyberPreKey || !signedPreKey || !remoteKeys.identityPublicKey) {
-      logger.error('[SessionService] Missing pre-keys in response');
+      logger.error('[SessionService] Missing pre-keys in response. Got fields:', {
+        hasIdentityPublicKey: !!remoteKeys.identityPublicKey,
+        hasIdentityKey: !!remoteKeys.identityKey,
+        hasRegistrationId: remoteKeys.registrationId !== undefined && remoteKeys.registrationId !== null,
+        hasSignedPreKey: !!signedPreKey,
+        hasPreKey: !!preKey,
+        hasKyberPreKey: !!kyberPreKey,
+        topLevelKeys: Object.keys(remoteKeys || {}),
+      });
       return false;
     }
 
@@ -151,7 +333,7 @@ class SessionService {
         kyberPreKeySignature: formattedKeys.kyberPreKeySignature,
       });
 
-      await SignalProtocol.establishSession(remoteUserIdStr);
+      await SignalProtocol.establishSession(remoteUserIdStr, formattedKeys.deviceId);
       sessionEstablished = true;
       logger.info('[SessionService] Session established successfully');
     } catch (error: any) {
@@ -228,8 +410,243 @@ class SessionService {
     return this.setSession(roomId, userId, `user-${userId}`);
   }
 
-  async ensureSessionInDatabase(roomId: number, remoteUserId: string): Promise<void> {
-    const existing = await sessionRepository.findByUserAndRoom(remoteUserId, roomId);
+  /**
+   * Establish a libsignal session with one of the user's OWN linked devices.
+   *
+   * Used by Fase C (sender-key redistribution after `deviceLinked`) where the
+   * primary needs to encrypt a distribution message for `(ownUserId, deviceId)`.
+   *
+   * Bypasses the anti-self guard in `setSession`: the target is a *different*
+   * device under the same userId, which is a legitimate libsignal session
+   * (libsignal keys sessions by `(userId, deviceId)` so two devices of the
+   * same user are distinct addresses).
+   *
+   * N>1 linked simultanei: the `session` table's unique index is
+   * `(idUser, idRoom, remoteUserDeviceId)` (migration v3), and the
+   * `upsert()` call below pins on the same triple, so a user can have N
+   * self-session rows per room — one per linked device. Both peer-side
+   * fan-out and self-side fan-out iterate the full deviceId cache from
+   * `getRemoteDeviceIds`, so all linked devices stay in sync across a
+   * restart.
+   */
+  async ensureSessionForOwnLinkedDevice(
+    roomId: number,
+    ownUserId: number,
+    deviceId: number,
+  ): Promise<boolean> {
+    const ownUserIdStr = String(ownUserId);
+
+    const existing = await sessionRepository.findByUserRoomAndDevice(ownUserIdStr, roomId, deviceId);
+    if (existing) {
+      try {
+        await this.resumeSession(roomId, ownUserIdStr, existing.remoteUserName, deviceId);
+        return true;
+      } catch {
+        // Fall through to recreate from a fresh /keys fetch.
+      }
+    }
+
+    const api = this.getApiForRoom(roomId);
+    let remoteKeys: any;
+    try {
+      remoteKeys = await api.getRemoteKeys(ownUserIdStr);
+    } catch (err) {
+      logger.error('[SessionService] ensureSelfLinked: fetch /keys failed:', err);
+      return false;
+    }
+
+    const bundles = this.bundlesFromResponse(remoteKeys);
+    if (bundles.length === 0) {
+      logger.warn('[SessionService] ensureSelfLinked: no bundles for own userId');
+      return false;
+    }
+
+    const allDeviceIds = bundles
+      .map((b) => Number(b.deviceId ?? PRIMARY_DEVICE_ID))
+      .filter((n) => Number.isFinite(n) && n > 0);
+    this.updateRemoteDeviceMap(ownUserIdStr, allDeviceIds);
+
+    const target = bundles.find((b) => Number(b.deviceId) === deviceId);
+    if (!target) {
+      logger.warn(`[SessionService] ensureSelfLinked: no bundle for device ${deviceId}, available ${allDeviceIds.join(',')}`);
+      return false;
+    }
+
+    const preKey = target.preKey || null;
+    const kyberPreKey = target.kyberPreKey || null;
+    const signedPreKey = target.signedPreKey || null;
+
+    if (!preKey || !kyberPreKey || !signedPreKey || !target.identityPublicKey) {
+      logger.error('[SessionService] ensureSelfLinked: missing pre-keys in bundle');
+      return false;
+    }
+
+    try {
+      await SignalProtocol.setRemoteUserKeys({
+        remoteUserId: ownUserIdStr,
+        preKeyId: Number(preKey.keyId),
+        preKeyPublicKey: String(preKey.keyData),
+        signedPreKeyId: Number(signedPreKey.keyId),
+        signedPreKeyPublicKey: String(signedPreKey.keyData),
+        signedPreKeySignature: String(signedPreKey.signature),
+        identityPublicKey: String(target.identityPublicKey),
+        registrationId: Number(target.registrationId),
+        deviceId,
+        name: `self-${deviceId}`,
+        kyberPreKeyId: Number(kyberPreKey.keyId),
+        kyberPreKeyPublicKey: String(kyberPreKey.keyData),
+        kyberPreKeySignature: String(kyberPreKey.signature),
+      });
+      await SignalProtocol.establishSession(ownUserIdStr, deviceId);
+
+      const now = Math.floor(Date.now() / 1000);
+      await sessionRepository.upsert({
+        idUser: ownUserIdStr,
+        idRoom: roomId,
+        remoteUserName: `self-${deviceId}`,
+        remoteUserDeviceId: deviceId,
+        identityVerified: 0,
+        created: existing?.created ?? now,
+        lastModified: now,
+      });
+      logger.info(`[SessionService] ensureSelfLinked: session ready for (own, ${deviceId}) in room ${roomId}`);
+      return true;
+    } catch (err) {
+      logger.error('[SessionService] ensureSelfLinked: native call failed:', err);
+      return false;
+    }
+  }
+
+  /**
+   * Establish a libsignal session with a specific linked device of a PEER.
+   *
+   * Used by the pair-wise fan-out send path: after the multi-device cache is
+   * refreshed (`refreshRemoteDeviceMap`), the deviceMap may include device IDs
+   * for which no native session exists yet — typically because the peer linked
+   * the device AFTER our original `setSession` completed. Calling
+   * `SignalProtocol.encryptMessage(msg, peerId, newDeviceId)` would throw
+   * "Session for remoteUserId X (device N) is not initialized". This method
+   * lazily fills the gap on a per-(userId, deviceId) basis.
+   *
+   * Mirrors `ensureSessionForOwnLinkedDevice` but does NOT bypass the
+   * self-session guard (we ARE talking to another user). Reuses the same
+   * `bundlesFromResponse` shape parsing so it works against both the
+   * single-bundle legacy `/keys/:userId` response and the multi-device
+   * `{ devices: [...] }` shape.
+   */
+  async ensureSessionForRemotePeerDevice(
+    roomId: number,
+    remoteUserId: number | string,
+    deviceId: number,
+  ): Promise<boolean> {
+    const remoteUserIdStr = String(remoteUserId);
+
+    const ownUserId = this.getOwnUserId();
+    const serverUserId = serverRegistry.getUserIdForRoom(roomId);
+    if (
+      (ownUserId && Number(remoteUserIdStr) === ownUserId) ||
+      (serverUserId && Number(remoteUserIdStr) === serverUserId)
+    ) {
+      logger.warn('[SessionService] ensurePeerDevice: refusing to set up self-session for', remoteUserIdStr);
+      return false;
+    }
+
+    const existing = await sessionRepository.findByUserRoomAndDevice(remoteUserIdStr, roomId, deviceId);
+    if (existing) {
+      try {
+        await this.resumeSession(roomId, remoteUserIdStr, existing.remoteUserName, deviceId);
+        return true;
+      } catch {
+        // Fall through to recreate from a fresh /keys fetch.
+      }
+    }
+
+    const api = this.getApiForRoom(roomId);
+    let remoteKeys: any;
+    try {
+      remoteKeys = await api.getRemoteKeys(remoteUserIdStr);
+    } catch (err) {
+      logger.error('[SessionService] ensurePeerDevice: fetch /keys failed for', remoteUserIdStr, err);
+      return false;
+    }
+
+    const bundles = this.bundlesFromResponse(remoteKeys);
+    if (bundles.length === 0) {
+      logger.warn('[SessionService] ensurePeerDevice: no bundles for', remoteUserIdStr);
+      return false;
+    }
+
+    const allDeviceIds = bundles
+      .map((b) => Number(b.deviceId ?? PRIMARY_DEVICE_ID))
+      .filter((n) => Number.isFinite(n) && n > 0);
+    this.updateRemoteDeviceMap(remoteUserIdStr, allDeviceIds);
+
+    const target = bundles.find((b) => Number(b.deviceId) === deviceId);
+    if (!target) {
+      logger.warn(
+        `[SessionService] ensurePeerDevice: no bundle for ${remoteUserIdStr}/${deviceId}, available ${allDeviceIds.join(',')}`,
+      );
+      return false;
+    }
+
+    const preKey = target.preKey || null;
+    const kyberPreKey = target.kyberPreKey || null;
+    const signedPreKey = target.signedPreKey || null;
+
+    if (!preKey || !kyberPreKey || !signedPreKey || !target.identityPublicKey) {
+      logger.error('[SessionService] ensurePeerDevice: missing pre-keys for', remoteUserIdStr, '/', deviceId);
+      return false;
+    }
+
+    try {
+      await SignalProtocol.setRemoteUserKeys({
+        remoteUserId: remoteUserIdStr,
+        preKeyId: Number(preKey.keyId),
+        preKeyPublicKey: String(preKey.keyData),
+        signedPreKeyId: Number(signedPreKey.keyId),
+        signedPreKeyPublicKey: String(signedPreKey.keyData),
+        signedPreKeySignature: String(signedPreKey.signature),
+        identityPublicKey: String(target.identityPublicKey),
+        registrationId: Number(target.registrationId),
+        deviceId,
+        name: remoteUserIdStr,
+        kyberPreKeyId: Number(kyberPreKey.keyId),
+        kyberPreKeyPublicKey: String(kyberPreKey.keyData),
+        kyberPreKeySignature: String(kyberPreKey.signature),
+      });
+      await SignalProtocol.establishSession(remoteUserIdStr, deviceId);
+
+      const now = Math.floor(Date.now() / 1000);
+      await sessionRepository.upsert({
+        idUser: remoteUserIdStr,
+        idRoom: roomId,
+        remoteUserName: existing?.remoteUserName ?? `user-${remoteUserIdStr}`,
+        remoteUserDeviceId: deviceId,
+        identityVerified: 0,
+        created: existing?.created ?? now,
+        lastModified: now,
+      });
+
+      const sessions = await sessionRepository.findByRoom(roomId);
+      this.sessions.set(roomId, sessions);
+
+      logger.info(`[SessionService] ensurePeerDevice: session ready for ${remoteUserIdStr}/${deviceId} in room ${roomId}`);
+      return true;
+    } catch (err) {
+      logger.error('[SessionService] ensurePeerDevice: native call failed for', remoteUserIdStr, '/', deviceId, err);
+      return false;
+    }
+  }
+
+  async ensureSessionInDatabase(roomId: number, remoteUserId: string, deviceId?: number): Promise<void> {
+    const effectiveDeviceId = deviceId && deviceId > 0 ? deviceId : PRIMARY_DEVICE_ID;
+
+    // Check for the specific (userId, roomId, deviceId) triple — not just
+    // any session for that peer. Otherwise messages from a linked device
+    // would be silently dropped onto an existing primary-device row, and
+    // the (userId, deviceId) libsignal session auto-established during
+    // decrypt would never be persisted for future boots.
+    const existing = await sessionRepository.findByUserRoomAndDevice(remoteUserId, roomId, effectiveDeviceId);
     if (existing) return;
 
     const now = Math.floor(Date.now() / 1000);
@@ -238,7 +655,7 @@ class SessionService {
         idUser: remoteUserId,
         idRoom: roomId,
         remoteUserName: `user-${remoteUserId}`,
-        remoteUserDeviceId: 1,
+        remoteUserDeviceId: effectiveDeviceId,
         created: now,
         lastModified: now,
         identityVerified: 0,
@@ -260,21 +677,45 @@ class SessionService {
       sessionsList = await sessionRepository.findAll();
     }
 
-    const resumedUsers = new Set<string>();
+    // Multi-device: resume one (userId, deviceId) at a time. Previously we
+    // deduped on userId alone, which left newly linked peer devices without
+    // a native session at boot — the first send path would still work via
+    // `ensureSessionForRemotePeerDevice`, but it would have to refetch keys
+    // and rebuild the session unnecessarily.
+    const resumedKeys = new Set<string>();
 
     for (const session of sessionsList) {
       const userId = String(session.idUser);
-      if (resumedUsers.has(userId)) continue;
+
+      // Re-hydrate the in-memory deviceMap from the persisted CSV so the
+      // fan-out send path knows about all linked peer devices BEFORE the
+      // first `/keys/:userId` refresh at `onConnected`. Repeated rows for
+      // the same userId carry the same CSV — we read it once per user.
+      if (!this.deviceMap.has(userId)) {
+        const csv = (session as any).remoteKnownDevices as string | null | undefined;
+        if (csv) {
+          const ids = csv
+            .split(',')
+            .map((s) => Number(s.trim()))
+            .filter((n) => Number.isFinite(n) && n > 0);
+          if (ids.length > 0) {
+            this.deviceMap.set(userId, new Set(ids));
+          }
+        }
+      }
+
+      const sessionKey = `${userId}/${session.remoteUserDeviceId}`;
+      if (resumedKeys.has(sessionKey)) continue;
 
       try {
         await SignalProtocol.resumeSession(userId, session.remoteUserName, session.remoteUserDeviceId);
-        resumedUsers.add(userId);
+        resumedKeys.add(sessionKey);
       } catch (error) {
-        logger.info('[SessionService] Error resuming session for', userId, error);
+        logger.info('[SessionService] Error resuming session for', sessionKey, error);
       }
     }
 
-    logger.info(`[SessionService] Resumed ${resumedUsers.size} unique sessions out of ${sessionsList.length} total`);
+    logger.info(`[SessionService] Resumed ${resumedKeys.size} unique (user,device) sessions out of ${sessionsList.length} total`);
 
     if (roomId) {
       this.sessions.set(roomId, sessionsList);
@@ -309,7 +750,12 @@ class SessionService {
 
     try {
       await this.applyRemoteKeys(remoteUserId, remoteKeys);
-      await SignalProtocol.establishSession(String(remoteUserId));
+      // Match the (userId, deviceId) slot that `applyRemoteKeys` just wrote
+      // via setRemoteUserKeys — without this, the existence check inside
+      // `establishSession` always looks at slot 1 and rejects when the
+      // remote user is on a linked device (deviceId != 1).
+      const recoveredDeviceId = Number(remoteKeys?.deviceId ?? 1) || 1;
+      await SignalProtocol.establishSession(String(remoteUserId), recoveredDeviceId);
       logger.info('[SessionService] Session recovered for', remoteUserId);
     } catch (error) {
       logger.error('[SessionService] Recovery failed:', error);
@@ -514,15 +960,50 @@ class SessionService {
     }
   }
 
-  async updateSessionTimestamp(roomId: number, userId: string): Promise<void> {
-    const session = await sessionRepository.findByUserAndRoom(userId, roomId);
-    if (session) {
-      await sessionRepository.updateLastMessageAt(session.id);
+  /**
+   * Bump `lastMessageAt` on the session row(s) for `(roomId, userId)`.
+   *
+   * When `deviceId` is supplied, only the single `(userId, roomId, deviceId)`
+   * row is updated — used by the decrypt path which knows exactly which
+   * peer device authored the message. When `deviceId` is omitted (legacy
+   * call sites) we stamp EVERY row matching `(userId, roomId)` so a peer
+   * with N linked devices doesn't end up with a single row drifting ahead
+   * of the others.
+   */
+  async updateSessionTimestamp(
+    roomId: number,
+    userId: string,
+    deviceId?: number,
+  ): Promise<void> {
+    if (deviceId !== undefined) {
+      const session = await sessionRepository.findByUserRoomAndDevice(userId, roomId, deviceId);
+      if (session) {
+        await sessionRepository.updateLastMessageAt(session.id);
+      }
+      return;
     }
+    await sessionRepository.updateLastMessageAtForUserRoom(userId, roomId);
   }
 
-  async deleteSession(roomId: number, userId: string): Promise<void> {
-    await sessionRepository.deleteByUserAndRoom(userId, roomId);
+  /**
+   * Drop the session(s) for `(roomId, userId)`.
+   *
+   * Without `deviceId`, deletes ALL rows for the user in the room — used
+   * when the peer is removed from the room entirely or the room itself
+   * goes away. With `deviceId`, deletes only the specific
+   * `(userId, roomId, deviceId)` row — used when a single linked device is
+   * revoked while others stay reachable.
+   */
+  async deleteSession(
+    roomId: number,
+    userId: string,
+    deviceId?: number,
+  ): Promise<void> {
+    if (deviceId !== undefined) {
+      await sessionRepository.deleteByUserRoomAndDevice(userId, roomId, deviceId);
+    } else {
+      await sessionRepository.deleteByUserAndRoom(userId, roomId);
+    }
 
     const sessions = await sessionRepository.findByRoom(roomId);
     this.sessions.set(roomId, sessions);
@@ -560,7 +1041,41 @@ class SessionService {
     const api = this.getApiForRoom(roomId);
     const remoteKeys = await api.getRemoteKeys(remoteUserId);
     if (!remoteKeys) throw new Error('Remote keys not found');
-    return remoteKeys;
+
+    // Normalize wire format. Whether the response is the new
+    // `{ devices: [...] }` shape or the legacy single bundle, we end up
+    // with the same canonical `userId → Set<deviceId>` mapping and a
+    // single normalized bundle to return (callers downstream of this
+    // method read fields like `identityPublicKey` directly).
+    const bundles = this.bundlesFromResponse(remoteKeys);
+    const deviceIds = bundles
+      .map((b) => Number(b.deviceId ?? PRIMARY_DEVICE_ID))
+      .filter((n) => Number.isFinite(n) && n > 0);
+    this.updateRemoteDeviceMap(remoteUserId, deviceIds);
+
+    if (bundles.length === 0) return remoteKeys;
+    return bundles[0];
+  }
+
+  /**
+   * Multi-device variant of `fetchRemoteKeys`: returns the full list of
+   * per-device bundles published by `remoteUserId`. Used by the fan-out
+   * send path that needs to establish one session per peer device.
+   *
+   * Also refreshes the multi-device cache as a side effect.
+   */
+  async fetchAllRemoteBundles(roomId: number, remoteUserId: string): Promise<any[]> {
+    const api = this.getApiForRoom(roomId);
+    const remoteKeys = await api.getRemoteKeys(remoteUserId);
+    if (!remoteKeys) return [];
+
+    const bundles = this.bundlesFromResponse(remoteKeys);
+    const deviceIds = bundles
+      .map((b) => Number(b.deviceId ?? PRIMARY_DEVICE_ID))
+      .filter((n) => Number.isFinite(n) && n > 0);
+    this.updateRemoteDeviceMap(remoteUserId, deviceIds);
+
+    return bundles;
   }
 
   /**

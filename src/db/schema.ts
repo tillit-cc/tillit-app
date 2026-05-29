@@ -112,6 +112,13 @@ export const profiles = sqliteTable('profile', {
 /**
  * Sessions table - stores Signal Protocol session metadata
  * Note: Actual session data is stored by the native Signal module
+ *
+ * `remoteKnownDevices` is a CSV of peer device IDs (e.g. "1,2,5") used to
+ * hydrate `sessionService.deviceMap` at boot, so the fan-out send path
+ * doesn't fall back to `[PRIMARY_DEVICE_ID]` in the window between restart
+ * and the first `/keys/:userId` refresh. The column is denormalized across
+ * every row with the same `idUser` — keeping a per-user dimension would
+ * require a separate table and the value is small (<200 chars typical).
  */
 export const sessions = sqliteTable('session', {
   id: integer('id').primaryKey({ autoIncrement: true }),
@@ -123,8 +130,9 @@ export const sessions = sqliteTable('session', {
   lastModified: integer('last_modified').default(sql`(strftime('%s', 'now'))`).notNull(),
   lastMessageAt: integer('last_message_at'),
   identityVerified: integer('identity_verified').default(0).notNull(),
+  remoteKnownDevices: text('remote_known_devices'),
 }, (table) => [
-  uniqueIndex('unique_room_user_session').on(table.idUser, table.idRoom),
+  uniqueIndex('unique_room_user_session').on(table.idUser, table.idRoom, table.remoteUserDeviceId),
 ]);
 
 /**

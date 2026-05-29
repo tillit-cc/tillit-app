@@ -15,6 +15,12 @@ import type {
   IdentityCheckResult,
   SenderKeyResult,
   GroupEncryptResult,
+  ExistingIdentityKey,
+  ProvisioningKeypair,
+  EncryptProvisioningResult,
+  DecryptProvisioningResult,
+  PairingSafetyNumberResult,
+  PeekProvisioningResult,
 } from './SignalProtocol.types';
 
 // Re-export types
@@ -23,7 +29,11 @@ export * from './SignalProtocol.types';
 // Native module interface - matches Swift AsyncFunction/Function signatures
 interface SignalProtocolModuleInterface extends NativeModule {
   // ===== IDENTITY INITIALIZATION =====
-  initializeIdentity(deviceId: number, name: string): Promise<PublicKeyBundle>;
+  initializeIdentity(
+    deviceId: number,
+    name: string,
+    existingIdentityKey?: ExistingIdentityKey | null
+  ): Promise<PublicKeyBundle>;
   getPublicIdentity(): Promise<PublicIdentity>;
   getSignedPreKeyInfo(): Promise<SignedPreKeyInfo>;
   getFullPublicBundle(): Promise<PublicKeyBundle>;
@@ -37,7 +47,10 @@ interface SignalProtocolModuleInterface extends NativeModule {
   // ===== SESSION MANAGEMENT =====
   setLocalUserId(userId: string): Promise<{ success: boolean }>;
   setRemoteUserKeys(params: RemoteUserKeys): Promise<void>;
-  establishSession(remoteUserId: string): Promise<SessionResult>;
+  establishSession(
+    remoteUserId: string,
+    remoteDeviceId?: number | null
+  ): Promise<SessionResult>;
   resumeSession(
     remoteUserId: string,
     remoteUserName: string,
@@ -45,8 +58,64 @@ interface SignalProtocolModuleInterface extends NativeModule {
   ): Promise<SessionResult>;
 
   // ===== ENCRYPTION/DECRYPTION =====
-  encryptMessage(message: string, remoteUserId: string): Promise<EncryptResult>;
+  encryptMessage(
+    message: string,
+    remoteUserId: string,
+    remoteDeviceId?: number | null
+  ): Promise<EncryptResult>;
   decryptMessage(encryptedMessage: string, remoteUserId: string, deviceId?: number | null): Promise<DecryptResult>;
+
+  // ===== MULTI-DEVICE PROVISIONING =====
+  // See _shared/api/multi-device-linking.md for the full protocol.
+  generateProvisioningKeypair(): Promise<ProvisioningKeypair>;
+  encryptProvisioning(
+    plaintextBase64: string,
+    recipientPublicKey: string,
+    senderPrivateKey: string
+  ): Promise<EncryptProvisioningResult>;
+  decryptProvisioning(
+    ciphertextBase64: string,
+    recipientPrivateKey: string,
+    senderPublicKey: string
+  ): Promise<DecryptProvisioningResult>;
+  getPairingSafetyNumber(
+    ephemeralPubA: string,
+    ephemeralPubB: string,
+    identityPub: string,
+    primaryUserId: string
+  ): Promise<PairingSafetyNumberResult>;
+
+  // ===== MULTI-DEVICE PROVISIONING — HIGH-LEVEL WRAPPERS =====
+  // Production path used by the pairing UI. The identity private key NEVER
+  // crosses the JS boundary: encryptProvisioningPayload reads it from the
+  // Keychain inside native code; consumeProvisioningPayload decrypts and
+  // installs it into the Keychain inside native code, returning only the
+  // device-fresh public bundle. The low-level encryptProvisioning/
+  // decryptProvisioning helpers remain available for tests and edge cases.
+  encryptProvisioningPayload(
+    recipientPublicKey: string,
+    senderPrivateKey: string,
+    primaryUserId: string,
+    primaryName?: string | null
+  ): Promise<EncryptProvisioningResult>;
+  peekProvisioningPayload(
+    ciphertextBase64: string,
+    recipientPrivateKey: string,
+    senderPublicKey: string
+  ): Promise<PeekProvisioningResult>;
+  consumeProvisioningPayload(
+    ciphertextBase64: string,
+    recipientPrivateKey: string,
+    senderPublicKey: string,
+    deviceId: number,
+    name: string
+  ): Promise<PublicKeyBundle>;
+
+  // ===== REMOTE SESSION MANAGEMENT (multi-device revocation) =====
+  deleteRemoteSession(
+    remoteUserId: string,
+    remoteDeviceId?: number | null
+  ): Promise<void>;
 
   // ===== IDENTITY VERIFICATION =====
   getSafetyNumber(remoteUserId: string): Promise<SafetyNumberResult>;
@@ -108,13 +177,24 @@ export const SignalProtocol = {
   // ===== IDENTITY INITIALIZATION =====
 
   /**
-   * Generate a new identity, save private keys in protected Keychain,
-   * and return ONLY the public keys for server upload.
+   * Generate a new identity (or import an existing one), save private keys
+   * in protected Keychain, and return ONLY the public keys for server upload.
+   *
+   * When `existingIdentityKey` is provided, the module imports the given
+   * X25519 identity keypair instead of generating a fresh one. This is the
+   * code path used by a newly linked device during multi-device pairing
+   * (see _shared/api/multi-device-linking.md). All other keys (signed
+   * pre-key, pre-keys, kyber pre-keys, registration id) are generated
+   * fresh on this device regardless.
    *
    * MUST call authenticate() BEFORE this method to access protected Keychain.
    */
-  initializeIdentity: (deviceId: number, name: string) =>
-    SignalProtocolModule.initializeIdentity(deviceId, name),
+  initializeIdentity: (
+    deviceId: number,
+    name: string,
+    existingIdentityKey?: ExistingIdentityKey | null
+  ) =>
+    SignalProtocolModule.initializeIdentity(deviceId, name, existingIdentityKey ?? null),
 
   /**
    * Get public identity data (for backend authentication).
@@ -172,9 +252,16 @@ export const SignalProtocol = {
 
   /**
    * Establish a session with a remote user (after setRemoteUserKeys).
+   *
+   * `remoteDeviceId` selects which session slot to verify — libsignal's store
+   * is indexed by `(remoteUserId, deviceId)`. Defaults to 1 if omitted, for
+   * backward-compat with single-device peers. Multi-device callers MUST pass
+   * the same deviceId they used in the preceding `setRemoteUserKeys` call,
+   * otherwise the existence check looks at the wrong slot and rejects with
+   * "Session not initialized" even when a valid session was just stored.
    */
-  establishSession: (remoteUserId: string) =>
-    SignalProtocolModule.establishSession(remoteUserId),
+  establishSession: (remoteUserId: string, remoteDeviceId?: number | null) =>
+    SignalProtocolModule.establishSession(remoteUserId, remoteDeviceId ?? null),
 
   /**
    * Resume an existing session with a remote user.
@@ -186,15 +273,219 @@ export const SignalProtocol = {
 
   /**
    * Encrypt a message for a remote user.
+   *
+   * `remoteDeviceId` selects which device of the peer to encrypt for
+   * (libsignal store is indexed by `(remoteUserId, deviceId)`). Defaults to
+   * 1 if omitted, for backward-compat with single-device peers. In a
+   * multi-device fan-out, the caller iterates over the peer's device list
+   * and invokes this method once per `(userId, deviceId)`.
    */
-  encryptMessage: (message: string, remoteUserId: string) =>
-    SignalProtocolModule.encryptMessage(message, remoteUserId),
+  encryptMessage: (
+    message: string,
+    remoteUserId: string,
+    remoteDeviceId?: number | null
+  ) =>
+    SignalProtocolModule.encryptMessage(message, remoteUserId, remoteDeviceId ?? null),
 
   /**
    * Decrypt a message from a remote user.
    */
   decryptMessage: (encryptedMessage: string, remoteUserId: string, deviceId?: number | null) =>
     SignalProtocolModule.decryptMessage(encryptedMessage, remoteUserId, deviceId ?? null),
+
+  // ===== MULTI-DEVICE PROVISIONING =====
+  //
+  // Crypto helpers used during the multi-device pairing flow. See
+  // _shared/api/multi-device-linking.md for the wire contract and
+  // _shared/decisions/0001-multi-device-architecture.md (ADR-0001) for
+  // the architectural rationale.
+
+  /**
+   * Generate a fresh X25519 ephemeral keypair for use in a single pairing
+   * exchange. Both the primary and the new device generate one of these
+   * during the pairing flow; the keypair MUST NOT be reused for any other
+   * purpose. Keys are returned base64-encoded — the private key is NOT
+   * persisted natively, the caller is responsible for keeping it in memory
+   * for the duration of the pairing and discarding it afterwards.
+   */
+  generateProvisioningKeypair: () =>
+    SignalProtocolModule.generateProvisioningKeypair(),
+
+  /**
+   * Encrypt the provisioning payload (the primary's identity private key
+   * plus minimal metadata) for the new device.
+   *
+   * Derives the AES-256-GCM key from `HKDF-SHA256(X25519(senderPrivateKey,
+   * recipientPublicKey), salt=∅, info="tillit/provisioning/v1", L=32)`.
+   * AAD is the constant string `"tillit/provisioning/v1"`. The returned
+   * ciphertext is base64 of the binary layout
+   * `[1B version=0x01][12B IV][N B ct][16B GCM tag]`.
+   *
+   * Both inputs are base64. `plaintextBase64` is the UTF-8 bytes of the
+   * JSON-stringified `ProvisioningPayloadV1` (see spec).
+   */
+  encryptProvisioning: (
+    plaintextBase64: string,
+    recipientPublicKey: string,
+    senderPrivateKey: string
+  ) =>
+    SignalProtocolModule.encryptProvisioning(
+      plaintextBase64,
+      recipientPublicKey,
+      senderPrivateKey
+    ),
+
+  /**
+   * Reverse of `encryptProvisioning`. Used by the new device to recover the
+   * primary's identity private key after polling
+   * `GET /auth/devices/link/result/:token`.
+   */
+  decryptProvisioning: (
+    ciphertextBase64: string,
+    recipientPrivateKey: string,
+    senderPublicKey: string
+  ) =>
+    SignalProtocolModule.decryptProvisioning(
+      ciphertextBase64,
+      recipientPrivateKey,
+      senderPublicKey
+    ),
+
+  /**
+   * Compute the out-of-band safety number for a pairing transcript. Both
+   * devices compute this independently and the user verifies that the two
+   * strings match across screens — mitigates a MITM at the server layer
+   * that swaps `ephemeralPubA`/`ephemeralPubB`.
+   *
+   * All key inputs are base64-encoded raw 32-byte X25519 public keys.
+   * `primaryUserId` is bound into the HKDF info to prevent replay of one
+   * transcript across different identities.
+   */
+  getPairingSafetyNumber: (
+    ephemeralPubA: string,
+    ephemeralPubB: string,
+    identityPub: string,
+    primaryUserId: string
+  ) =>
+    SignalProtocolModule.getPairingSafetyNumber(
+      ephemeralPubA,
+      ephemeralPubB,
+      identityPub,
+      primaryUserId
+    ),
+
+  // ===== MULTI-DEVICE PROVISIONING — HIGH-LEVEL WRAPPERS =====
+  //
+  // These two methods are the production code path used by the pairing UI.
+  // Unlike the low-level encryptProvisioning/decryptProvisioning primitives
+  // (which require the JS caller to hand in the plaintext containing the
+  // identity private key), these wrappers keep the identity private key
+  // confined to native code:
+  //
+  //   - `encryptProvisioningPayload`: primary side. Reads its own identity
+  //     keypair from the Keychain, assembles the ProvisioningPayloadV1
+  //     plaintext internally, performs ECDHE + HKDF + AES-256-GCM, returns
+  //     only the ciphertext.
+  //
+  //   - `consumeProvisioningPayload`: new-device side. Performs the inverse
+  //     decrypt, validates the embedded identityKeyPub against the
+  //     deserialized IdentityKeyPair (mismatch → throw), and installs the
+  //     imported identity into the Keychain. Returns the freshly generated
+  //     public bundle for upload, never the private material.
+  //
+  // This matches the TilliT "protection" principle: secret material must
+  // never live in JS memory, where it could be observed by debugger hooks
+  // or survive in the GC.
+
+  /**
+   * Primary side: produce the encrypted provisioning payload to hand to a
+   * pending new device. Requires the user to be authenticated.
+   *
+   * @param recipientPublicKey base64 of the new device's ephemeral X25519 public key
+   * @param senderPrivateKey   base64 of the primary's ephemeral X25519 private key (fresh per pairing — never the identity priv)
+   * @param primaryUserId      bound into the plaintext so the new device can verify
+   * @param primaryName        optional display name for the linked device record
+   */
+  encryptProvisioningPayload: (
+    recipientPublicKey: string,
+    senderPrivateKey: string,
+    primaryUserId: string,
+    primaryName?: string | null
+  ) =>
+    SignalProtocolModule.encryptProvisioningPayload(
+      recipientPublicKey,
+      senderPrivateKey,
+      primaryUserId,
+      primaryName ?? null
+    ),
+
+  /**
+   * New-device side: decrypt the provisioning payload, run the integrity
+   * check (identityKeyPub must match the deserialized IdentityKeyPair), and
+   * return ONLY the public fields the UI needs to compute and display the
+   * pairing safety number. The decrypted identity private key is read and
+   * discarded inside native code without being persisted or returned.
+   *
+   * Call this BEFORE `consumeProvisioningPayload`: only after the user has
+   * visually confirmed that the safety number matches on both screens do
+   * we commit the import via `consumeProvisioningPayload`. This split
+   * preserves the "trust-no-server" guarantee — a malicious server that
+   * swaps E_pub or P_pub during the pairing is caught at the safety-number
+   * comparison, BEFORE any persistent state changes on the new device.
+   */
+  peekProvisioningPayload: (
+    ciphertextBase64: string,
+    recipientPrivateKey: string,
+    senderPublicKey: string
+  ) =>
+    SignalProtocolModule.peekProvisioningPayload(
+      ciphertextBase64,
+      recipientPrivateKey,
+      senderPublicKey
+    ),
+
+  /**
+   * New-device side: decrypt the provisioning payload produced by the
+   * primary, install the imported identity into the Keychain, generate
+   * fresh per-device keys (signed pre-key, pre-keys, kyber pre-keys,
+   * registrationId), and return the public bundle for server upload.
+   * Requires the user to be authenticated.
+   *
+   * Should be called only AFTER `peekProvisioningPayload` returned and
+   * the user confirmed the safety number — see that method's docs.
+   */
+  consumeProvisioningPayload: (
+    ciphertextBase64: string,
+    recipientPrivateKey: string,
+    senderPublicKey: string,
+    deviceId: number,
+    name: string
+  ) =>
+    SignalProtocolModule.consumeProvisioningPayload(
+      ciphertextBase64,
+      recipientPrivateKey,
+      senderPublicKey,
+      deviceId,
+      name
+    ),
+
+  // ===== REMOTE SESSION MANAGEMENT (multi-device revocation) =====
+
+  /**
+   * Remove the libsignal session record for `(remoteUserId, remoteDeviceId)`.
+   * Invoked when a peer revokes one of its devices (socket event
+   * `deviceRevoked` with `self: false`). Subsequent `encryptMessage` calls
+   * targeting the same `(userId, deviceId)` will fail until the peer
+   * re-publishes a bundle.
+   *
+   * Defaults to deviceId=1 if omitted, matching the single-device legacy
+   * behavior. Pass an explicit deviceId for multi-device peers.
+   */
+  deleteRemoteSession: (
+    remoteUserId: string,
+    remoteDeviceId?: number | null
+  ) =>
+    SignalProtocolModule.deleteRemoteSession(remoteUserId, remoteDeviceId ?? null),
 
   // ===== IDENTITY VERIFICATION =====
 

@@ -75,6 +75,8 @@ jest.mock('../session.service', () => ({
     deleteSessionsByRoom: jest.fn().mockResolvedValue(undefined),
     loadSessions: jest.fn().mockResolvedValue([]),
     initializePreKeyTracking: jest.fn().mockResolvedValue(undefined),
+    getRemoteDeviceIds: jest.fn(() => [] as number[]),
+    fetchAllRemoteBundles: jest.fn().mockResolvedValue([]),
   },
 }));
 
@@ -191,8 +193,9 @@ describe('ChatService — handleSystemMessage', () => {
 
     await (chatService as any).handleSystemMessage(envelope, 100);
 
-    // Should delete the room from the database
-    expect(mockRoomRepo.delete).toHaveBeenCalledWith(100);
+    // performLocalRoomCleanup uses hardDelete (full row removal) rather than the
+    // soft `delete` method — the room is gone for good, no resurrection on resync.
+    expect(mockRoomRepo.hardDelete).toHaveBeenCalledWith(100);
 
     // Should remove from the store
     expect(mockChatStore.removeRoomFromList).toHaveBeenCalledWith(100);

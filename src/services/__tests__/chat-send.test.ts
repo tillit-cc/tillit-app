@@ -75,6 +75,12 @@ jest.mock('../session.service', () => ({
     deleteSessionsByRoom: jest.fn().mockResolvedValue(undefined),
     loadSessions: jest.fn().mockResolvedValue([]),
     initializePreKeyTracking: jest.fn().mockResolvedValue(undefined),
+    getRemoteDeviceIds: jest.fn(() => [] as number[]),
+    fetchAllRemoteBundles: jest.fn().mockResolvedValue([]),
+    ensureSessionForOwnLinkedDevice: jest.fn().mockResolvedValue(true),
+    ensureSessionForRemotePeerDevice: jest.fn().mockResolvedValue(true),
+    refreshRemoteDeviceMap: jest.fn().mockResolvedValue([] as number[]),
+    invalidateRemoteDeviceMap: jest.fn(),
   },
 }));
 
@@ -118,6 +124,7 @@ import SignalProtocol from 'signal-protocol';
 import { messageRepository } from '@/db/repositories/message.repository';
 import { roomRepository } from '@/db/repositories/room.repository';
 import { sessionRepository } from '@/db/repositories/session.repository';
+import { sessionService } from '../session.service';
 
 // Typed references to the mocked repositories for assertions
 const mockMessageRepo = messageRepository as jest.Mocked<typeof messageRepository>;
@@ -220,5 +227,61 @@ describe('ChatService — sendMessage', () => {
       expect.any(String),
       expect.objectContaining({ idStatus: MessageStatus.SENT })
     );
+  });
+
+  describe('fan-out wire shape', () => {
+    afterEach(() => {
+      // Restore the module-level default so deviceMap-dependent tests
+      // outside this block don't inherit a stale per-user mapping.
+      (sessionService.getRemoteDeviceIds as jest.Mock).mockImplementation(() => []);
+    });
+
+    it('emits recipients[] with userId as number (not string) for peer entries', async () => {
+      mockSocket.sendMessage.mockResolvedValue({ success: true });
+
+      await chatService.sendMessage(100, 'Hello peer');
+
+      expect(mockSocket.sendMessage).toHaveBeenCalledWith(
+        expect.objectContaining({
+          recipients: expect.arrayContaining([
+            expect.objectContaining({
+              userId: 99,
+              deviceId: 1,
+              ciphertext: expect.any(String),
+            }),
+          ]),
+        })
+      );
+      const call = mockSocket.sendMessage.mock.calls.at(-1)![0];
+      for (const recipient of call.recipients) {
+        expect(typeof recipient.userId).toBe('number');
+      }
+    });
+
+    it('includes self-fanout entries for ownUserId linked devices with userId as number', async () => {
+      // Two peer sessions (peer 99) and self-cache reports a linked device 4
+      // for ownUserId 42. The encrypt() loop must produce a recipient for
+      // (42, 4) — not (42, 1), which is the primary and the sender itself.
+      (sessionService.getRemoteDeviceIds as jest.Mock).mockImplementation((uid: string) => {
+        if (uid === '42') return [1, 4];
+        if (uid === '99') return [1];
+        return [];
+      });
+      mockSocket.sendMessage.mockResolvedValue({ success: true });
+
+      await chatService.sendMessage(100, 'Hello multi-device');
+
+      const call = mockSocket.sendMessage.mock.calls.at(-1)![0];
+      const selfFanout = call.recipients.find(
+        (r: any) => r.userId === 42 && r.deviceId === 4
+      );
+      expect(selfFanout).toBeDefined();
+      expect(typeof selfFanout.userId).toBe('number');
+      // Sender's own primary device must NOT be in recipients — that's an echo.
+      const selfPrimary = call.recipients.find(
+        (r: any) => r.userId === 42 && r.deviceId === 1
+      );
+      expect(selfPrimary).toBeUndefined();
+    });
   });
 });

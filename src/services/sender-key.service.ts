@@ -5,12 +5,22 @@ import { senderKeyRepository } from '@/db/repositories/sender-key.repository';
 import { roomRepository } from '@/db/repositories/room.repository';
 import { useAuthStore } from '@/stores/auth.store';
 import {
+  PRIMARY_DEVICE_ID,
   SENDER_KEY_THRESHOLD,
   SENDER_KEY_MESSAGE_ROTATION_THRESHOLD,
   SENDER_KEY_ROTATION_THRESHOLD_SECONDS,
 } from '@/config/app.config';
 import { logger } from '@/utils/logger';
 import { toBackendRoomId } from '@/utils/server-id';
+
+/**
+ * Recipient of a sender-key distribution. Accepts both legacy (number =
+ * userId, fan-out to every cached device) and explicit (`{userId, deviceId}`)
+ * forms so callers can either redistribute to a whole user (member joins
+ * a room) or to a specific linked device (primary → its own new device
+ * after `deviceLinked`).
+ */
+export type SenderKeyTarget = number | { userId: number; deviceId?: number };
 
 class SenderKeyService {
   private getOwnUserId(): number | null {
@@ -90,34 +100,83 @@ class SenderKeyService {
     }
   }
 
+  /**
+   * Build `(userId, deviceId)` targets from a polymorphic member list.
+   *
+   * - `number` (legacy): expand to every cached device id for that user
+   *   via `sessionService.getRemoteDeviceIds`. Fall back to
+   *   `[PRIMARY_DEVICE_ID]` when the cache is empty so single-device peers
+   *   still receive a distribution.
+   * - `{ userId, deviceId }`: target exactly that device. Used for
+   *   `deviceLinked` self-redistribution (primary → own new linked device)
+   *   and any caller that already knows the precise destination.
+   * - `{ userId }` without `deviceId`: expand exactly like the legacy form.
+   */
+  private expandTargets(members: SenderKeyTarget[]): Array<{ userId: number; deviceId: number }> {
+    const out: Array<{ userId: number; deviceId: number }> = [];
+    for (const m of members) {
+      if (typeof m === 'number') {
+        const devices = this.devicesForUser(m);
+        for (const d of devices) out.push({ userId: m, deviceId: d });
+      } else if (typeof m.deviceId === 'number') {
+        out.push({ userId: m.userId, deviceId: m.deviceId });
+      } else {
+        const devices = this.devicesForUser(m.userId);
+        for (const d of devices) out.push({ userId: m.userId, deviceId: d });
+      }
+    }
+    return out;
+  }
+
+  private devicesForUser(userId: number): number[] {
+    const cached = sessionService.getRemoteDeviceIds(String(userId));
+    return cached.length > 0 ? cached : [PRIMARY_DEVICE_ID];
+  }
+
   private async distributeSenderKey(
     roomId: number,
     distributionId: string,
     distributionMessage: string,
-    memberIds: number[]
+    members: SenderKeyTarget[]
   ): Promise<void> {
-    const distributions: Array<{ recipientUserId: number; encryptedSenderKey: string }> = [];
-    const failedMembers: number[] = [];
+    const distributions: Array<{ recipientUserId: number; recipientDeviceId: number; encryptedSenderKey: string }> = [];
+    const failedMembers = new Set<number>();
+    const targets = this.expandTargets(members);
 
-    for (const memberId of memberIds) {
+    const senderUserId = this.getOwnUserId();
+
+    for (const { userId, deviceId } of targets) {
       try {
-        await sessionService.ensureSession(roomId, memberId);
+        if (senderUserId != null && userId === senderUserId) {
+          // Self-fan-out: distributing the sender key to one of OUR OWN
+          // linked devices (Fase C, post `deviceLinked`). The normal
+          // `ensureSession` blocks self-targets — use the dedicated path.
+          const ok = await sessionService.ensureSessionForOwnLinkedDevice(roomId, userId, deviceId);
+          if (!ok) {
+            logger.warn(`[SenderKey] Skipping self-linked target ${userId}/${deviceId}: session not ready`);
+            continue;
+          }
+        } else {
+          await sessionService.ensureSession(roomId, userId);
+        }
 
         const { encryptedMessage } = await SignalProtocol.encryptMessage(
           encodeURIComponent(distributionMessage),
-          String(memberId),
+          String(userId),
+          deviceId,
         );
 
         distributions.push({
-          recipientUserId: memberId,
+          recipientUserId: userId,
+          recipientDeviceId: deviceId,
           encryptedSenderKey: encryptedMessage,
         });
 
-        await this.removeFailedDistribution(roomId, memberId);
+        await this.removeFailedDistribution(roomId, userId);
       } catch (error) {
-        logger.error(`[SenderKey] Failed to encrypt for user ${memberId}:`, error);
-        failedMembers.push(memberId);
-        await this.trackFailedDistribution(roomId, memberId, distributionId);
+        logger.error(`[SenderKey] Failed to encrypt for ${userId}/${deviceId}:`, error);
+        failedMembers.add(userId);
+        await this.trackFailedDistribution(roomId, userId, distributionId);
       }
     }
 
@@ -125,11 +184,11 @@ class SenderKeyService {
       const api = this.getApiForRoom(roomId);
       const backendRoomId = toBackendRoomId(roomId);
       await api.uploadSenderKeyDistribution(backendRoomId, distributionId, distributions);
-      logger.info(`[SenderKey] Distributed to ${distributions.length} members`);
+      logger.info(`[SenderKey] Distributed to ${distributions.length} (userId,deviceId) targets`);
     }
 
-    if (failedMembers.length > 0) {
-      logger.warn(`[SenderKey] Failed for ${failedMembers.length} members:`, failedMembers);
+    if (failedMembers.size > 0) {
+      logger.warn(`[SenderKey] Failed for ${failedMembers.size} members:`, Array.from(failedMembers));
     }
   }
 
@@ -297,7 +356,17 @@ class SenderKeyService {
     }
   }
 
-  async redistributeToNewMembers(roomId: number, newMemberIds: number[]): Promise<void> {
+  /**
+   * Redistribute the existing sender-key state to one or more new targets.
+   *
+   * Two usage shapes:
+   *  - `number[]` (legacy): list of userIds joining the room. Each one is
+   *    expanded to every cached device.
+   *  - `Array<{ userId, deviceId? }>`: explicit targets. Use the object
+   *    form with a concrete `deviceId` for the post-pairing flow where the
+   *    primary redistributes only to its own brand-new linked device.
+   */
+  async redistributeToNewMembers(roomId: number, newMembers: SenderKeyTarget[]): Promise<void> {
     const senderUserId = this.getOwnUserId();
     if (!senderUserId) return;
 
@@ -307,7 +376,7 @@ class SenderKeyService {
       return;
     }
 
-    logger.info('[SenderKey] Redistributing to new members:', newMemberIds, 'room:', roomId);
+    logger.info('[SenderKey] Redistributing to new members:', newMembers, 'room:', roomId);
 
     try {
       const { distributionMessage } = await SignalProtocol.createSenderKeySession(
@@ -315,9 +384,9 @@ class SenderKeyService {
         session.distributionId
       );
 
-      await this.distributeSenderKey(roomId, session.distributionId, distributionMessage, newMemberIds);
+      await this.distributeSenderKey(roomId, session.distributionId, distributionMessage, newMembers);
 
-      logger.info('[SenderKey] Redistributed to', newMemberIds.length, 'new members');
+      logger.info('[SenderKey] Redistributed to', newMembers.length, 'new targets');
     } catch (error) {
       logger.error('[SenderKey] redistributeToNewMembers failed:', error);
     }

@@ -6,6 +6,7 @@ import { useTranslation } from 'react-i18next';
 import i18next from 'i18next';
 import { Button } from '@/components/ui/Button';
 import { useAuthStore, getDefaultApi } from '@/stores/auth.store';
+import { useDeviceStore } from '@/stores/device.store';
 import { appInitService } from '@/services/app-init.service';
 import { initDatabase } from '@/db/client';
 import SignalProtocol from 'signal-protocol';
@@ -42,6 +43,20 @@ function describeErrorForLog(error: any): string {
     return `${method} ${base}${url}\n${error.message ?? 'Network Error'}`;
   }
   return error?.message ?? String(error);
+}
+
+/**
+ * L4: Returns true if the device-pairing store is in a non-terminal phase
+ * on either side (primary scanner OR new device). Used by the wipe paths
+ * to refuse to throw away the identity while a linked device is mid-flight
+ * — see the comments in `wipeAndCreate` / `deleteLocalIdentity` for the
+ * concrete failure mode this guards against.
+ */
+function isPairingInProgress(): boolean {
+  const { pairingPrimary, pairingNewDevice } = useDeviceStore.getState();
+  const inFlight = (phase: string | undefined) =>
+    phase !== undefined && phase !== 'idle' && phase !== 'done' && phase !== 'error';
+  return inFlight(pairingPrimary?.phase) || inFlight(pairingNewDevice?.phase);
 }
 
 /**
@@ -188,6 +203,18 @@ export default function LoginScreen() {
 
   // Wipe all data and create new identity
   const wipeAndCreate = useCallback(async () => {
+    // L4: don't wipe the identity while a pairing flow is in progress.
+    // If a new device is mid-pairing and we wipe here, the new device
+    // will install a copy of an identity that this device is about to
+    // throw away — leaving the linked device orphaned with an obsolete
+    // keypair. Same problem on the new-device side: a wipe here means
+    // the linked device that just installed our identity will diverge
+    // from the freshly-created one.
+    if (isPairingInProgress()) {
+      Alert.alert(t('auth.pairingActiveTitle'), t('auth.pairingActiveMsg'));
+      return;
+    }
+
     setIdentityState('creating');
 
     try {
@@ -276,6 +303,12 @@ export default function LoginScreen() {
 
   // Delete local identity (keys from Keychain only)
   const deleteLocalIdentity = useCallback(async () => {
+    // L4: see the symmetric guard in `wipeAndCreate` — both wipe paths
+    // need to refuse while a pairing is active.
+    if (isPairingInProgress()) {
+      Alert.alert(t('auth.pairingActiveTitle'), t('auth.pairingActiveMsg'));
+      return;
+    }
     Alert.alert(
       t('auth.deleteIdentityTitle'),
       t('auth.deleteIdentityMsg'),
@@ -378,9 +411,16 @@ export default function LoginScreen() {
                 {t('auth.secureMessages')}
               </Text>
 
-              <View className="w-full">
+              <View className="w-full gap-3">
                 <Button onPress={wipeAndCreate} size="lg">
                   {t('auth.createIdentity')}
+                </Button>
+                <Button
+                  onPress={() => router.push('/claim-device')}
+                  variant="outline"
+                  size="lg"
+                >
+                  {t('linkedDevices.claimTitle')}
                 </Button>
               </View>
             </View>

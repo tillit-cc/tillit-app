@@ -47,7 +47,7 @@ jest.mock('@/db/repositories/profile.repository', () => ({
 }));
 
 // Mock services
-const mockSocket = { onMessage: jest.fn(() => jest.fn()), onPacket: jest.fn(() => jest.fn()), onStateChange: jest.fn(() => jest.fn()), onSenderKeysAvailable: jest.fn(() => jest.fn()), sendMessage: jest.fn().mockResolvedValue({ success: true }), sendPacket: jest.fn().mockResolvedValue({ success: true }), isConnected: jest.fn(() => true), clearAllServiceHandlers: jest.fn(), joinRoom: jest.fn() };
+const mockSocket = { onMessage: jest.fn(() => jest.fn()), onPacket: jest.fn(() => jest.fn()), onStateChange: jest.fn(() => jest.fn()), onSenderKeysAvailable: jest.fn(() => jest.fn()), onRoomDeleted: jest.fn(() => jest.fn()), onUserLeftRoom: jest.fn(() => jest.fn()), onDeviceLinked: jest.fn(() => jest.fn()), onDeviceRevoked: jest.fn(() => jest.fn()), onPeerDeviceLinked: jest.fn(() => jest.fn()), sendMessage: jest.fn().mockResolvedValue({ success: true }), sendPacket: jest.fn().mockResolvedValue({ success: true }), isConnected: jest.fn(() => true), clearAllServiceHandlers: jest.fn(), joinRoom: jest.fn() };
 const mockApi = { getAllRooms: jest.fn().mockResolvedValue({ rooms: [] }), getRoomMembers: jest.fn().mockResolvedValue([]), createRoom: jest.fn(), joinRoom: jest.fn(), deleteRoom: jest.fn(), deleteMessage: jest.fn(), deleteMedia: jest.fn() };
 
 jest.mock('../server-registry', () => ({
@@ -75,6 +75,8 @@ jest.mock('../session.service', () => ({
     deleteSessionsByRoom: jest.fn().mockResolvedValue(undefined),
     loadSessions: jest.fn().mockResolvedValue([]),
     initializePreKeyTracking: jest.fn().mockResolvedValue(undefined),
+    getRemoteDeviceIds: jest.fn(() => [] as number[]),
+    fetchAllRemoteBundles: jest.fn().mockResolvedValue([]),
   },
 }));
 
@@ -166,19 +168,25 @@ describe('ChatService — init & destroy', () => {
     expect(queueService.setSendFunction).not.toHaveBeenCalled();
   });
 
-  it('registerSocketHandlers: registers 4 handlers (onMessage, onPacket, onStateChange, onSenderKeysAvailable)', () => {
+  it('registerSocketHandlers: registers room/message/device handlers and tracks unsubscribes', () => {
     (chatService as any).registerSocketHandlers(1);
 
     expect(mockSocket.onMessage).toHaveBeenCalledTimes(1);
     expect(mockSocket.onPacket).toHaveBeenCalledTimes(1);
     expect(mockSocket.onStateChange).toHaveBeenCalledTimes(1);
     expect(mockSocket.onSenderKeysAvailable).toHaveBeenCalledTimes(1);
+    expect(mockSocket.onRoomDeleted).toHaveBeenCalledTimes(1);
+    expect(mockSocket.onUserLeftRoom).toHaveBeenCalledTimes(1);
+    // Default-server-only handlers: server 1 is the default in the test registry
+    expect(mockSocket.onDeviceLinked).toHaveBeenCalledTimes(1);
+    expect(mockSocket.onDeviceRevoked).toHaveBeenCalledTimes(1);
+    expect(mockSocket.onPeerDeviceLinked).toHaveBeenCalledTimes(1);
 
     // Each handler registration should return an unsub function
     expect(typeof mockSocket.onMessage.mock.results[0].value).toBe('function');
 
-    // Unsubscribes should be tracked
-    expect((chatService as any).unsubscribes.length).toBe(4);
+    // 9 unsubscribes tracked: 6 always + 3 device-specific (default server)
+    expect((chatService as any).unsubscribes.length).toBe(9);
   });
 
   it('destroy: unsubscribes all handlers, stops queue, resets state', () => {

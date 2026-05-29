@@ -30,6 +30,20 @@ export function redirectSystemPath({
       return '/join-room';
     }
 
+    // Multi-device pairing deep link (wire v2):
+    //   tillit://link?v=2&i=<sessionId>&s=<server>&e=<E_pub>
+    // Expo Router strips the scheme and surfaces it as /link?v=2&i=...
+    // In wire v2 the QR is shown by the NEW device and scanned by the
+    // PRIMARY — so an inbound deep link means the primary should drive
+    // the scan flow without opening the camera. We park the URL in
+    // app.store and route to /link-device (the primary scanner screen).
+    // Length bounded for safety.
+    if (path.length < 1024 && /^\/link\?/.test(path)) {
+      const fullUrl = `tillit:/${path}`;
+      useAppStore.getState().setPendingPrimaryScanLink(fullUrl);
+      return '/link-device';
+    }
+
     return path;
   } catch {
     return '/';

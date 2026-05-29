@@ -161,10 +161,11 @@ function createTables(database: SQLiteDatabase) {
       created INTEGER NOT NULL DEFAULT (strftime('%s', 'now')),
       last_modified INTEGER NOT NULL DEFAULT (strftime('%s', 'now')),
       last_message_at INTEGER,
-      identity_verified INTEGER NOT NULL DEFAULT 0
+      identity_verified INTEGER NOT NULL DEFAULT 0,
+      remote_known_devices TEXT
     );
 
-    CREATE UNIQUE INDEX IF NOT EXISTS unique_room_user_session ON session(id_user, id_room);
+    CREATE UNIQUE INDEX IF NOT EXISTS unique_room_user_session ON session(id_user, id_room, remote_user_device_id);
 
     -- Identity table
     CREATE TABLE IF NOT EXISTS identity (
@@ -231,6 +232,27 @@ const MIGRATIONS: { version: number; statements: string[] }[] = [
     version: 2,
     statements: [
       'ALTER TABLE server ADD COLUMN is_tor INTEGER NOT NULL DEFAULT 0',
+    ],
+  },
+  {
+    // Multi-device: expand `session` uniqueness to include the per-device
+    // dimension so the primary can persist multiple sessions for the same
+    // peer (one per remote deviceId) without overwriting. Fresh installs
+    // already create the index with the 3-column shape in createTables();
+    // this migration brings existing installs in line.
+    version: 3,
+    statements: [
+      'DROP INDEX IF EXISTS unique_room_user_session',
+      'CREATE UNIQUE INDEX IF NOT EXISTS unique_room_user_session ON session(id_user, id_room, remote_user_device_id)',
+    ],
+  },
+  {
+    // Multi-device cache refresh (frontend-0008): persist the peer device
+    // list alongside each session row so the fan-out send path has a hot
+    // cache at boot, without waiting for the first /keys/:userId refresh.
+    version: 4,
+    statements: [
+      'ALTER TABLE session ADD COLUMN remote_known_devices TEXT',
     ],
   },
 ];

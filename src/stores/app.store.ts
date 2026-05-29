@@ -38,6 +38,8 @@ interface AppState {
 
   // Deep link state
   pendingInviteCode: string | null;
+  /** Pending multi-device pairing URL (tillit://link?v=2&i=...&s=...&e=...) — scanned by primary */
+  pendingPrimaryScanLink: string | null;
 
   // Push notification state
   pendingNotificationRoomId: number | null;
@@ -71,6 +73,7 @@ interface AppState {
 
   // Deep link actions
   setPendingInviteCode: (code: string | null) => void;
+  setPendingPrimaryScanLink: (link: string | null) => void;
 
   // Push notification actions
   setPendingNotificationRoomId: (roomId: number | null) => void;
@@ -91,6 +94,7 @@ export const useAppStore = create<AppState>()(
     lastActiveTimestamp: Date.now(),
     notificationBanner: null,
     pendingInviteCode: null,
+    pendingPrimaryScanLink: null,
     pendingNotificationRoomId: null,
     securityAlerts: [],
     settings: {
@@ -182,6 +186,11 @@ export const useAppStore = create<AppState>()(
     setPendingInviteCode: (code) =>
       set((state) => {
         state.pendingInviteCode = code;
+      }),
+
+    setPendingPrimaryScanLink: (link) =>
+      set((state) => {
+        state.pendingPrimaryScanLink = link;
       }),
 
     // Push notification actions

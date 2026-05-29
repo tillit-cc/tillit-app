@@ -33,7 +33,11 @@ jest.mock('./server-registry', () => ({
 }));
 
 jest.mock('./session.service', () => ({
-  sessionService: { ensureSession: jest.fn().mockResolvedValue(true) },
+  sessionService: {
+    ensureSession: jest.fn().mockResolvedValue(true),
+    ensureSessionForOwnLinkedDevice: jest.fn().mockResolvedValue(true),
+    getRemoteDeviceIds: jest.fn(() => [] as number[]),
+  },
 }));
 
 let mockSenderKeyRepo = createMockSenderKeyRepository();
@@ -212,19 +216,23 @@ describe('SenderKeyService', () => {
       expect(sessionService.ensureSession).toHaveBeenCalledWith(ROOM_ID, 101);
       expect(sessionService.ensureSession).toHaveBeenCalledWith(ROOM_ID, 102);
 
-      // encryptMessage called for each member
+      // encryptMessage called once per (userId, deviceId) — with no
+      // cached devices the fan-out falls back to PRIMARY_DEVICE_ID=1.
       expect(SignalProtocol.encryptMessage).toHaveBeenCalledTimes(3);
       expect(SignalProtocol.encryptMessage).toHaveBeenCalledWith(
         encodeURIComponent('mockDistributionMessage'),
         '100',
+        1,
       );
       expect(SignalProtocol.encryptMessage).toHaveBeenCalledWith(
         encodeURIComponent('mockDistributionMessage'),
         '101',
+        1,
       );
       expect(SignalProtocol.encryptMessage).toHaveBeenCalledWith(
         encodeURIComponent('mockDistributionMessage'),
         '102',
+        1,
       );
 
       // Upload contains 3 distributions
@@ -288,11 +296,12 @@ describe('SenderKeyService', () => {
       // Decrypt the encrypted sender key
       expect(SignalProtocol.decryptMessage).toHaveBeenCalledWith('encrypted-key-data', '99');
 
-      // Process the distribution
+      // Process the distribution (4th arg is senderDeviceId, null when absent)
       expect(SignalProtocol.processSenderKeyDistribution).toHaveBeenCalledWith(
         String(ROOM_ID),
         '99',
         'remote-dist-msg',
+        null,
       );
 
       // Upsert session
@@ -417,6 +426,7 @@ describe('SenderKeyService', () => {
         'group-ciphertext',
         String(ROOM_ID),
         '99',
+        null,
       );
       expect(result).toBe('group-decrypted');
     });

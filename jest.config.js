@@ -16,6 +16,7 @@ module.exports = {
     '^@/i18n/(.*)$': '<rootDir>/src/i18n/$1',
     '^@/__tests__/(.*)$': '<rootDir>/src/__tests__/$1',
     '^signal-protocol$': '<rootDir>/__mocks__/signal-protocol.ts',
+    '^tor-proxy$': '<rootDir>/__mocks__/tor-proxy.ts',
     '^expo-secure-store$': '<rootDir>/__mocks__/expo-secure-store.ts',
     '^expo-haptics$': '<rootDir>/__mocks__/expo-haptics.ts',
     '^expo-file-system$': '<rootDir>/__mocks__/expo-file-system.ts',

@@ -34,6 +34,16 @@ interface AuthState {
   token: string | null;
   tokenPayload: TokenPayload | null;
   userId: number | null;
+  /**
+   * This device's libsignal `deviceId`. Cached from
+   * `SignalProtocol.getPublicIdentity()` after the local identity unlocks
+   * (post biometric authenticate). Stays `null` until then.
+   *
+   * Used by the multi-device send path to skip self when fanning out
+   * (replaces the `=== PRIMARY_DEVICE_ID` heuristic that was correct only
+   * for the primary device).
+   */
+  deviceId: number | null;
   error: string | null;
 
   // Identity state (for login flow)
@@ -52,6 +62,7 @@ interface AuthState {
   setError: (error: string | null) => void;
   setIdentityState: (state: IdentityState) => void;
   setLoadingMessage: (message: string) => void;
+  setDeviceId: (deviceId: number | null) => void;
 
   // Biometric actions
   setBiometricAuthenticated: (authenticated: boolean) => void;
@@ -63,6 +74,12 @@ interface AuthState {
   logout: () => Promise<void>;
   loadStoredToken: () => Promise<boolean>;
   checkLocalIdentity: () => Promise<boolean>;
+  /**
+   * Read this device's libsignal deviceId via `getPublicIdentity()` and
+   * cache it in the store. Idempotent: callers can invoke it whenever the
+   * local identity is unlocked.
+   */
+  refreshDeviceId: () => Promise<void>;
 
   // Selectors
   isTokenExpired: () => boolean;
@@ -76,6 +93,7 @@ export const useAuthStore = create<AuthState>()(
     token: null,
     tokenPayload: null,
     userId: null,
+    deviceId: null,
     error: null,
     identityState: 'checking' as IdentityState,
     loadingMessage: '',
@@ -105,6 +123,7 @@ export const useAuthStore = create<AuthState>()(
         state.token = null;
         state.tokenPayload = null;
         state.userId = null;
+        state.deviceId = null;
         state.isAuthenticated = false;
       });
     },
@@ -144,6 +163,23 @@ export const useAuthStore = create<AuthState>()(
       set((state) => {
         state.hasStoredIdentity = hasIdentity;
       }),
+
+    setDeviceId: (deviceId) =>
+      set((state) => {
+        state.deviceId = deviceId;
+      }),
+
+    refreshDeviceId: async () => {
+      try {
+        const pub = await SignalProtocol.getPublicIdentity();
+        const id = typeof pub?.deviceId === 'number' ? pub.deviceId : null;
+        set((state) => {
+          state.deviceId = id;
+        });
+      } catch (err) {
+        logger.warn('[auth.store] refreshDeviceId failed:', err);
+      }
+    },
 
     // Check if a local identity exists in the Keychain
     checkLocalIdentity: async () => {
