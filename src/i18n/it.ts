@@ -39,6 +39,8 @@ export default {
     generatingKeys: 'Generazione chiavi crittografiche...',
     registeringIdentity: 'Registrazione identità...',
     deletingIdentity: 'Eliminazione identità...',
+    pairingActiveTitle: 'Associazione dispositivo in corso',
+    pairingActiveMsg: 'C\'è un\'associazione dispositivo attiva. Annulla quel flusso prima di reimpostare l\'identità — proseguire ora invaliderebbe il dispositivo che si sta collegando.',
     // Biometric
     unlockPrompt: 'Sblocca TilliT per accedere alle tue conversazioni',
     createIdentityPrompt: 'Autenticati per creare la tua identità sicura',

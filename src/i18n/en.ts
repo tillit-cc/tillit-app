@@ -39,6 +39,8 @@ export default {
     generatingKeys: 'Generating cryptographic keys...',
     registeringIdentity: 'Registering identity...',
     deletingIdentity: 'Deleting identity...',
+    pairingActiveTitle: 'Device pairing in progress',
+    pairingActiveMsg: 'A device pairing flow is active. Cancel it before resetting the identity — proceeding now would invalidate the device being linked.',
     // Biometric
     unlockPrompt: 'Unlock TilliT to access your conversations',
     createIdentityPrompt: 'Authenticate to create your secure identity',

@@ -102,7 +102,7 @@ export const sessionRepository = {
   },
 
   /**
-   * Update last message timestamp
+   * Update last message timestamp on a single row by primary key.
    */
   async updateLastMessageAt(id: number): Promise<void> {
     const db = getDatabase();
@@ -111,6 +111,22 @@ export const sessionRepository = {
       .update(sessions)
       .set({ lastMessageAt: now, lastModified: sql`(strftime('%s', 'now'))` })
       .where(eq(sessions.id, id));
+  },
+
+  /**
+   * Stamp `lastMessageAt` on EVERY row matching `(userId, roomId)` — i.e.
+   * across all linked devices of the user. Used when a message is observed
+   * for the peer/self regardless of which specific device authored it,
+   * so all the per-device rows stay in sync and `lastModified DESC`
+   * ordering on `findByUserAndRoom` does not arbitrarily pick one row.
+   */
+  async updateLastMessageAtForUserRoom(userId: string, roomId: number): Promise<void> {
+    const db = getDatabase();
+    const now = Math.floor(Date.now() / 1000);
+    await db
+      .update(sessions)
+      .set({ lastMessageAt: now, lastModified: sql`(strftime('%s', 'now'))` })
+      .where(and(eq(sessions.idUser, userId), eq(sessions.idRoom, roomId)));
   },
 
   /**
@@ -133,13 +149,36 @@ export const sessionRepository = {
   },
 
   /**
-   * Delete session by user and room
+   * Delete all sessions for `(userId, roomId)` — every linked device of
+   * the user, in this room. Used when the peer is removed from the room
+   * or the room itself goes away.
    */
   async deleteByUserAndRoom(userId: string, roomId: number): Promise<void> {
     const db = getDatabase();
     await db
       .delete(sessions)
       .where(and(eq(sessions.idUser, userId), eq(sessions.idRoom, roomId)));
+  },
+
+  /**
+   * Delete the session row for a single linked device of a user in a room.
+   * Used when one specific peer device (or our own linked device) is
+   * revoked while the others stay reachable — symmetric with the libsignal
+   * `deleteRemoteSession(userId, deviceId)` native call.
+   */
+  async deleteByUserRoomAndDevice(
+    userId: string,
+    roomId: number,
+    deviceId: number,
+  ): Promise<void> {
+    const db = getDatabase();
+    await db
+      .delete(sessions)
+      .where(and(
+        eq(sessions.idUser, userId),
+        eq(sessions.idRoom, roomId),
+        eq(sessions.remoteUserDeviceId, deviceId),
+      ));
   },
 
   /**

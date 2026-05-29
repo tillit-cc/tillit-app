@@ -421,13 +421,13 @@ class SessionService {
    * (libsignal keys sessions by `(userId, deviceId)` so two devices of the
    * same user are distinct addresses).
    *
-   * DB metadata limitation: the `session` table has a uniqueIndex on
-   * `(idUser, idRoom)`, so we can only persist one self-session row per
-   * room. Practically this means v1 fully supports ONE linked device at a
-   * time. Linking a second device while a first is already linked may
-   * overwrite the first row; the native libsignal store still keeps both
-   * sessions in memory, so sends continue to work, but a restart will
-   * resume only the last-written one. Tracked as a follow-up.
+   * N>1 linked simultanei: the `session` table's unique index is
+   * `(idUser, idRoom, remoteUserDeviceId)` (migration v3), and the
+   * `upsert()` call below pins on the same triple, so a user can have N
+   * self-session rows per room — one per linked device. Both peer-side
+   * fan-out and self-side fan-out iterate the full deviceId cache from
+   * `getRemoteDeviceIds`, so all linked devices stay in sync across a
+   * restart.
    */
   async ensureSessionForOwnLinkedDevice(
     roomId: number,
@@ -960,15 +960,50 @@ class SessionService {
     }
   }
 
-  async updateSessionTimestamp(roomId: number, userId: string): Promise<void> {
-    const session = await sessionRepository.findByUserAndRoom(userId, roomId);
-    if (session) {
-      await sessionRepository.updateLastMessageAt(session.id);
+  /**
+   * Bump `lastMessageAt` on the session row(s) for `(roomId, userId)`.
+   *
+   * When `deviceId` is supplied, only the single `(userId, roomId, deviceId)`
+   * row is updated — used by the decrypt path which knows exactly which
+   * peer device authored the message. When `deviceId` is omitted (legacy
+   * call sites) we stamp EVERY row matching `(userId, roomId)` so a peer
+   * with N linked devices doesn't end up with a single row drifting ahead
+   * of the others.
+   */
+  async updateSessionTimestamp(
+    roomId: number,
+    userId: string,
+    deviceId?: number,
+  ): Promise<void> {
+    if (deviceId !== undefined) {
+      const session = await sessionRepository.findByUserRoomAndDevice(userId, roomId, deviceId);
+      if (session) {
+        await sessionRepository.updateLastMessageAt(session.id);
+      }
+      return;
     }
+    await sessionRepository.updateLastMessageAtForUserRoom(userId, roomId);
   }
 
-  async deleteSession(roomId: number, userId: string): Promise<void> {
-    await sessionRepository.deleteByUserAndRoom(userId, roomId);
+  /**
+   * Drop the session(s) for `(roomId, userId)`.
+   *
+   * Without `deviceId`, deletes ALL rows for the user in the room — used
+   * when the peer is removed from the room entirely or the room itself
+   * goes away. With `deviceId`, deletes only the specific
+   * `(userId, roomId, deviceId)` row — used when a single linked device is
+   * revoked while others stay reachable.
+   */
+  async deleteSession(
+    roomId: number,
+    userId: string,
+    deviceId?: number,
+  ): Promise<void> {
+    if (deviceId !== undefined) {
+      await sessionRepository.deleteByUserRoomAndDevice(userId, roomId, deviceId);
+    } else {
+      await sessionRepository.deleteByUserAndRoom(userId, roomId);
+    }
 
     const sessions = await sessionRepository.findByRoom(roomId);
     this.sessions.set(roomId, sessions);

@@ -122,7 +122,7 @@ describe('ChatService — decrypt', () => {
     await (chatService as any).decrypt('encrypted-body', 100, 99);
 
     expect(sessionService.ensureSessionInDatabase).toHaveBeenCalledWith(100, '99', undefined);
-    expect(sessionService.updateSessionTimestamp).toHaveBeenCalledWith(100, '99');
+    expect(sessionService.updateSessionTimestamp).toHaveBeenCalledWith(100, '99', undefined);
   });
 
   it('Error 6 (InvalidMessage): does NOT call recoverSession, returns false', async () => {

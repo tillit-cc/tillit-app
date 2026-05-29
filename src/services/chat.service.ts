@@ -1585,7 +1585,7 @@ class ChatService {
       // deviceId=1, and the next restart would lose the libsignal session
       // that the auto-establish path silently set up during this decrypt.
       await sessionService.ensureSessionInDatabase(roomId, remoteUserId, effectiveDeviceId ?? undefined);
-      await sessionService.updateSessionTimestamp(roomId, remoteUserId);
+      await sessionService.updateSessionTimestamp(roomId, remoteUserId, effectiveDeviceId ?? undefined);
 
       return decodeURIComponent(decryptResult.message);
     } catch (error: any) {
