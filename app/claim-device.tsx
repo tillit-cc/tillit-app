@@ -182,10 +182,16 @@ export default function ClaimDeviceScreen() {
       case 'SESSION_EXPIRED':
       case 'POLL_TIMEOUT':
         return t('linkedDevices.errorTokenExpired');
+      case 'SESSION_ALREADY_CONSUMED':
+        return t('linkedDevices.errorAlreadyConsumed');
       case 'SESSION_NOT_FOUND':
         return t('linkedDevices.errorTokenNotFound');
       case 'IDENTITY_KEY_TAMPERED':
         return t('linkedDevices.errorIdentityTampered');
+      case 'PUBKEY_SHARED_MISSING':
+        return t('linkedDevices.errorPubkeySharedMissing');
+      case 'ASSIGNED_DEVICE_ID_MISMATCH':
+        return t('linkedDevices.errorAssignedDeviceIdMismatch');
       default:
         return t('linkedDevices.errorGeneric');
     }

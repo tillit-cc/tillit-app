@@ -271,7 +271,13 @@ class DeviceService {
                 ? 'SESSION_NOT_PUBKEY_SHARED'
                 : 'SESSION_CONFLICT')
             : status === 410
-              ? 'SESSION_EXPIRED'
+              // L1: same distinction as the new-device poll loop —
+              // SESSION_ALREADY_CONSUMED maps to "QR already used"
+              // wording so the user knows a re-attempt with the same
+              // QR will keep failing.
+              ? (errCode === 'SESSION_ALREADY_CONSUMED'
+                  ? 'SESSION_ALREADY_CONSUMED'
+                  : 'SESSION_EXPIRED')
               : 'COMPLETE_FAILED';
       store.setPrimaryError(code);
       throw err;
@@ -398,8 +404,20 @@ class DeviceService {
           return;
         }
         if (status === 410) {
-          useDeviceStore.getState().setNewDeviceError('SESSION_EXPIRED');
-          this.rejectPayloadWaiter(sessionId, new Error('SESSION_EXPIRED'));
+          // L1: 410 collapses to two distinct user-facing situations.
+          // The server marks the session `consumed_at` after the first
+          // successful `completed` read and rejects further polls with
+          // `SESSION_ALREADY_CONSUMED`. That is operationally different
+          // from a session that timed out before any device ever read it
+          // (`SESSION_EXPIRED`): the first is "you've already used this
+          // QR — start a new one", the second is "the QR sat unused too
+          // long". Surface the distinction so the UI can word the
+          // recovery action correctly.
+          const code = err?.response?.data?.code === 'SESSION_ALREADY_CONSUMED'
+            ? 'SESSION_ALREADY_CONSUMED'
+            : 'SESSION_EXPIRED';
+          useDeviceStore.getState().setNewDeviceError(code);
+          this.rejectPayloadWaiter(sessionId, new Error(code));
           return;
         }
         logger.warn('[DeviceService] linkSessionResult poll error:', err?.message ?? err);

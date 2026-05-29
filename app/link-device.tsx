@@ -169,6 +169,8 @@ export default function LinkDeviceScreen() {
       case 'SESSION_EXPIRED':
       case 'POLL_TIMEOUT':
         return t('linkedDevices.errorTokenExpired');
+      case 'SESSION_ALREADY_CONSUMED':
+        return t('linkedDevices.errorAlreadyConsumed');
       case 'SESSION_NOT_FOUND':
         return t('linkedDevices.errorTokenNotFound');
       case 'PUBKEY_MISMATCH':
