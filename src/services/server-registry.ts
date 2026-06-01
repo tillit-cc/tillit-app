@@ -10,6 +10,7 @@ import { logger } from '@/utils/logger';
 import { torService } from './tor.service';
 import { isOnionUrl } from './tor-axios-adapter';
 import { buildChallengeMessageBase64 } from '@/utils/challenge';
+import { isDeviceAuthMismatchError } from '@/utils/auth-errors';
 import * as SecureStore from 'expo-secure-store';
 
 export class ServerRegistry {
@@ -337,7 +338,15 @@ export class ServerRegistry {
       try {
         await this.uploadPreKeysToServer(serverId);
       } catch (error) {
-        logger.warn(`[ServerRegistry] Pre-key upload failed for server ${serverId} during reconnect:`, error);
+        // ADR-0010 diagnostics: a 409 here means this device tried to register
+        // a device-auth key that differs from the one the server already has
+        // bound for it (stale/regenerated key). Surfaced distinctly; the cure
+        // is the primary-recovery flow (see _shared/questions.md).
+        if (isDeviceAuthMismatchError(error)) {
+          logger.warn(`[ServerRegistry] DEVICE_AUTH_MISMATCH on /keys for server ${serverId} — device-auth key differs from server-bound key`);
+        } else {
+          logger.warn(`[ServerRegistry] Pre-key upload failed for server ${serverId} during reconnect:`, error);
+        }
       }
 
       // Reconnect socket (now that we have a valid token)
@@ -456,6 +465,9 @@ export class ServerRegistry {
     // Sign with domain-separated message — see src/utils/challenge.ts
     const challengeMessage = buildChallengeMessageBase64(challengeResponse.nonce, api.baseUrl);
     const { signature } = await SignalProtocol.signWithIdentityKey(challengeMessage);
+    // ADR-0010: per-device server-auth signature over the same challenge.
+    const { signature: deviceAuthSignature } =
+      await SignalProtocol.signWithDeviceAuth(challengeMessage);
 
     // Authenticate
     const response = await api.authenticateWithIdentity({
@@ -467,6 +479,7 @@ export class ServerRegistry {
       signedPreKeySignature: signedPreKeyInfo.signature,
       challengeId: challengeResponse.challengeId,
       challengeSignature: signature,
+      deviceAuthSignature,
     });
 
     if (!response?.accessToken) {
@@ -508,6 +521,9 @@ export class ServerRegistry {
     const api = this.getApi(serverId);
 
     const bundle = await SignalProtocol.getFullPublicBundle();
+    // ADR-0010: register this device's server-auth public key alongside the
+    // bundle (TOFU-bound server-side on first upload, idempotent after).
+    const { publicKey: deviceAuthPublicKey } = await SignalProtocol.getDeviceAuthPublicKey();
     // Server accepts max 100 pre-keys per upload. After replenishments
     // the native keystore may hold more — send only the first 100.
     const preKeys = bundle.preKeys.slice(0, 100);
@@ -516,6 +532,7 @@ export class ServerRegistry {
       deviceId: bundle.deviceId,
       registrationId: bundle.registrationId,
       identityPublicKey: bundle.identityPublicKey,
+      deviceAuthPublicKey,
       signedPreKey: {
         keyId: bundle.signedPreKey.id,
         keyData: bundle.signedPreKey.publicKey,
