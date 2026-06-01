@@ -150,6 +150,15 @@ export class ApiService {
     signedPreKeySignature: string;
     challengeId: string;
     challengeSignature: string;
+    // ADR-0010: per-device server-auth signature over the SAME challenge
+    // message as `challengeSignature`. Required once the device has a
+    // registered device-auth key; optional during transition mode.
+    deviceAuthSignature?: string;
+    // ADR-0010 primary recovery (step 1): when true (deviceId=1 only, with
+    // `deviceAuthSignature` OMITTED), the server skips device-auth verification
+    // and returns a recovery-scoped JWT usable ONLY for the subsequent
+    // `recoverPrimaryAuthKey` call. See `_shared/api/per-device-server-auth.md`.
+    recoverPrimary?: boolean;
   }): Promise<{ accessToken: string; userId: number; isNewUser: boolean; banned?: boolean }> {
     return this.post('/auth/identity', payload);
   }
@@ -207,6 +216,21 @@ export class ApiService {
   // Key management endpoints
   async syncPublicKeys(payload: any): Promise<void> {
     return this.post('/keys', payload);
+  }
+
+  /**
+   * ADR-0010 primary recovery. Re-bind `deviceId: 1` to a new device-auth
+   * key after the primary lost its old one (e.g. reinstall). The server
+   * revokes ALL linked devices (clean slate) — the caller MUST warn the user
+   * before calling this. Authorized by a JWT obtained proving the shared
+   * identity (transition mode is allowed only for this primary-recovery flow).
+   */
+  async recoverPrimaryAuthKey(deviceAuthPublicKey: string): Promise<void> {
+    return this.post('/keys', {
+      deviceId: 1,
+      deviceAuthPublicKey,
+      recoverPrimary: true,
+    });
   }
 
   async getKeyStatus(): Promise<any> {

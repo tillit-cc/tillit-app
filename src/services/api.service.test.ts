@@ -281,4 +281,48 @@ describe('ApiService', () => {
       expect(result).toEqual(challengeResponse);
     });
   });
+
+  // ADR-0010: per-device server-auth credential
+  describe('authenticateWithIdentity', () => {
+    it('forwards deviceAuthSignature in the /auth/identity body', async () => {
+      mockAxiosInstance.post.mockResolvedValueOnce({
+        data: { accessToken: 'a.b.c', userId: 7, isNewUser: false },
+      });
+
+      await api.authenticateWithIdentity({
+        identityPublicKey: 'idpub',
+        registrationId: 1,
+        deviceId: 1,
+        signedPreKeyPublicKey: 'spk',
+        signedPreKeyId: 2,
+        signedPreKeySignature: 'sig',
+        challengeId: 'ch-1',
+        challengeSignature: 'csig',
+        deviceAuthSignature: 'dasig',
+      });
+
+      expect(mockAxiosInstance.post).toHaveBeenCalledWith(
+        '/auth/identity',
+        expect.objectContaining({
+          challengeSignature: 'csig',
+          deviceAuthSignature: 'dasig',
+        }),
+        undefined,
+      );
+    });
+  });
+
+  describe('recoverPrimaryAuthKey', () => {
+    it('posts deviceId=1 with recoverPrimary flag to /keys', async () => {
+      mockAxiosInstance.post.mockResolvedValueOnce({ data: undefined });
+
+      await api.recoverPrimaryAuthKey('newDeviceAuthPub==');
+
+      expect(mockAxiosInstance.post).toHaveBeenCalledWith(
+        '/keys',
+        { deviceId: 1, deviceAuthPublicKey: 'newDeviceAuthPub==', recoverPrimary: true },
+        undefined,
+      );
+    });
+  });
 });
