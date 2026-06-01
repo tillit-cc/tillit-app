@@ -42,6 +42,10 @@ constants/theme.ts
 
 `App start → checkDeviceSecurity → /unsecure | /locked | loadStoredToken`. Auth è basata su **identity locale** (`userId` in SecureStore), NON sul JWT server: token scaduto + `userId` presente ⇒ `isAuthenticated=true` (auth server posticipata al bootstrap via `connectAll()`). Dopo auth → `/(tabs)` → `appInitService.initialize()` (bootstrap idempotente: 10 step, recoverStuckMessages → loadSessions → init chat → loadRooms → connectAll → refreshPreKeys → registerPush → lifecycle listeners). DB SQLCipher inizializzato **dopo** unlock biometrico (chiave in protected storage del native module).
 
+### Per-device server-auth (ADR-0010)
+
+Auth al server in **due firme** sulla stessa challenge domain-separated: `signWithIdentityKey` (identità E2E condivisa) **+** `signWithDeviceAuth` (**device-auth keypair** Curve25519 per-device, distinta dall'identità, mai trasmessa, fuori dall'E2E). La pubblica (`getDeviceAuthPublicKey`) viaggia in `POST /keys` (`deviceAuthPublicKey`) → TOFU-bind server-side. Chiude il #4: un linked device non può più rivendicare `deviceId: 1`. **Lazy-gen** native al primo accesso → copre upgrade/fresh/linked senza migrazione. Backward-compat: server in **transition mode** finché la chiave non è bound (flag server `DEVICE_AUTH_REQUIRED`, OQ-5). Errori: `401 DEVICE_AUTH_INVALID/REQUIRED`, `409 DEVICE_AUTH_MISMATCH` → `src/utils/auth-errors.ts`. **Recovery primary** (`auth.store.recoverPrimaryAuth`, solo `deviceId===1`): flusso 3-step — login recovery `POST /auth/identity {recoverPrimary:true}` **senza** `deviceAuthSignature` → JWT `scope:"recover"`; `POST /keys {recoverPrimary:true, deviceAuthPublicKey}` ribinda + **wipe dei linked**; re-login normale → JWT regolare. Fallback a login normale su `409 PRIMARY_RECOVERY_NOT_NEEDED`. UI in `login.tsx` (alert distruttivo, solo primary). Spec: `_shared/api/per-device-server-auth.md`, `_shared/decisions/0010-…md`.
+
 ### onConnected (per ogni (ri)connessione socket)
 
 `syncAllRoomsFromBackend → syncRoomMembersAndSessions → queueService.forceProcess → fetchPendingSenderKeysForAllRooms → refreshPreKeysIfNeeded → retrySendingMessages`.
@@ -135,20 +139,20 @@ Base: `EXPO_PUBLIC_API_URL` (default `https://api.tillit.cc`). JWT in `Authoriza
 
 | Path | Note |
 |---|---|
-| `POST /auth/challenge`, `POST /auth/identity` | Challenge-response → JWT |
+| `POST /auth/challenge`, `POST /auth/identity` | Challenge-response → JWT. `/auth/identity` porta **due firme**: `challengeSignature` (identità) + `deviceAuthSignature` (device-auth, ADR-0010) |
 | `POST /auth/token/push` | Registra push token (skip per Tor) |
 | `GET /auth/status` | Health check (no JWT) → `ok|banned|unauthorized` |
 | `DELETE /auth/account` | GDPR / Apple 5.1.1(v) |
 | `POST /auth/devices/link/init|share-pubkey|complete`, `GET /auth/devices/link/session/:id/result`, `GET/DELETE /auth/devices[/:id|/me]` | Multi-device pairing v2.1 |
 | `GET/PUT /chat`, `POST /chat/:code`, `DELETE /chat/:id` (→ `{action: 'deleted'|'left'}`), `DELETE /chat/:roomId/message/:messageId`, `GET /chat/:id/members` | Chat |
-| `POST /keys`, `GET /keys/status/self`, `GET /keys/:userId` | Bundle Signal |
+| `POST /keys`, `GET /keys/status/self`, `GET /keys/:userId` | Bundle Signal. `POST /keys` porta `deviceAuthPublicKey` (TOFU-bind) + `recoverPrimary?` (ADR-0010) |
 | `POST /sender-keys/initialize/:roomId|distribute/:roomId`, `GET /sender-keys/:roomId` | Sender keys |
 | `POST /moderation/report` | DSA |
 | `POST /media/ephemeral`, `POST /media/:id/viewed` | Ephemeral images |
 
 ## API native principali
 
-**`modules/signal-protocol`** (`src/index.ts`): `initializeIdentity`, `loadStoredLocalUser`, `authenticate(reason)`, `lock()`, `setRemoteUserKeys`, `establishSession`, `resumeSession(userId, name, deviceId)`, `encryptMessage`, `decryptMessage(msg, userId, deviceId?)` (auto-establish PreKeySignalMessage via X3DH), `createSenderKeySession`, `encryptGroupMessage`, `decryptGroupMessage(ct, roomId, senderId, senderDeviceId?)`, `replenishPreKeys`, `rotateSignedPreKey`, `signWithIdentityKey`, `getFullPublicBundle`, `checkDeviceSecurity`, `checkIdentityKeyChanged`, `clearIdentity`.
+**`modules/signal-protocol`** (`src/index.ts`): `initializeIdentity`, `loadStoredLocalUser`, `authenticate(reason)`, `lock()`, `setRemoteUserKeys`, `establishSession`, `resumeSession(userId, name, deviceId)`, `encryptMessage`, `decryptMessage(msg, userId, deviceId?)` (auto-establish PreKeySignalMessage via X3DH), `createSenderKeySession`, `encryptGroupMessage`, `decryptGroupMessage(ct, roomId, senderId, senderDeviceId?)`, `replenishPreKeys`, `rotateSignedPreKey`, `signWithIdentityKey`, `getDeviceAuthPublicKey`, `signWithDeviceAuth` (ADR-0010, device-auth keypair lazy-gen), `getFullPublicBundle`, `checkDeviceSecurity`, `checkIdentityKeyChanged`, `clearIdentity`.
 
 **`modules/tor-proxy`** (`src/index.ts`): `start() → {socksPort}`, `stop`, `getStatus` (`stopped|connecting|bootstrapping|connected`), `getBootstrapProgress`, `httpRequest(config)`, `openWebSocket`, `sendWebSocket`, `closeWebSocket`. Eventi: `onBootstrapProgress`, `onWebSocketMessage|Open|Close|Error`.
 
