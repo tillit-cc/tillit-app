@@ -53,6 +53,16 @@ export default {
     noServerResponse: '(nessuna risposta dal server)',
     identityCreateError: "Errore nella creazione dell'identità.",
     deleteError: "Errore nell'eliminazione",
+    // ADR-0010: per-device server-auth
+    deviceAuthInvalidTitle: 'Verifica dispositivo fallita',
+    deviceAuthInvalidMsg: 'Questo dispositivo non è più riconosciuto dal server. Per accedere di nuovo dovrai reimpostare l\'identità (verranno scollegati tutti i dispositivi collegati) oppure ri-collegare questo dispositivo.',
+    deviceAuthRequiredMsg: 'Questo server richiede la registrazione delle chiavi del dispositivo prima dell\'accesso. Riprova; se l\'errore persiste, reimposta l\'identità.',
+    // ADR-0010: primary recovery
+    recoverPrimaryTitle: 'Ripristina accesso',
+    recoverPrimaryMsg: 'Questo dispositivo principale non è più riconosciuto dal server. Ripristinando l\'accesso, TUTTI i dispositivi collegati verranno scollegati e dovranno essere ri-associati. Continuare?',
+    recoverPrimaryAction: 'Ripristina',
+    recovering: 'Ripristino accesso...',
+    recoverPrimaryError: 'Ripristino dell\'accesso fallito.',
     // Alerts
     newIdentityTitle: 'Nuova identità',
     newIdentityMsg: 'Tutti i dati locali verranno eliminati. Continuare?',

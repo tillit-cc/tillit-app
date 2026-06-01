@@ -53,6 +53,16 @@ export default {
     noServerResponse: '(no response from server)',
     identityCreateError: 'Error creating identity.',
     deleteError: 'Error deleting',
+    // ADR-0010: per-device server-auth
+    deviceAuthInvalidTitle: 'Device verification failed',
+    deviceAuthInvalidMsg: 'This device is no longer recognised by the server. To sign in again you will need to reset your identity (all linked devices will be unlinked) or re-link this device.',
+    deviceAuthRequiredMsg: 'This server requires device keys to be registered before sign-in. Please retry; if the error persists, reset your identity.',
+    // ADR-0010: primary recovery
+    recoverPrimaryTitle: 'Restore access',
+    recoverPrimaryMsg: 'This primary device is no longer recognised by the server. Restoring access will unlink ALL linked devices, which will need to be paired again. Continue?',
+    recoverPrimaryAction: 'Restore',
+    recovering: 'Restoring access...',
+    recoverPrimaryError: 'Failed to restore access.',
     // Alerts
     newIdentityTitle: 'New identity',
     newIdentityMsg: 'All local data will be deleted. Continue?',
