@@ -27,6 +27,12 @@ public class SignalProtocolModule: Module {
     // Keys for Keychain storage
     private let identityKeyPairKeychainKey = "local-identity-key-pair"
     private let localUserMetadataKeychainKey = "local-user-metadata"
+    // ADR-0010: per-device server-auth credential. A Curve25519 keypair
+    // distinct from the (shared) E2E identity — used ONLY to authenticate
+    // THIS device to the server. The private key never leaves the device and
+    // never enters the E2E protocol. Stored in the protected service so
+    // `clearAll()` (clearIdentity / resetIdentityState) wipes it too.
+    private let deviceAuthKeyPairKeychainKey = "device-auth-key-pair"
 
     // M-10 FIX: Thread-safe accessors for encryptedSessions.
     //
@@ -123,6 +129,36 @@ public class SignalProtocolModule: Module {
             return legacyData
         }
         return nil
+    }
+
+    // ADR-0010: return the device-auth private key, creating and persisting
+    // a fresh Curve25519 keypair on first access. Lazy creation means this
+    // covers every path uniformly — fresh install, linked device after
+    // provisioning, and existing installs upgrading to a build that has the
+    // device-auth credential — without touching `performIdentitySetup`.
+    // Requires an active unlock window (the key lives in protected storage).
+    private func loadOrCreateDeviceAuthPrivateKey() throws -> PrivateKey {
+        let keychain = KeychainHelper.shared
+        guard keychain.isAuthenticated else {
+            throw NSError(domain: "SignalProtocol", code: 401,
+                userInfo: [NSLocalizedDescriptionKey: "Must call authenticate() first"])
+        }
+        if let data = keychain.loadProtected(for: self.deviceAuthKeyPairKeychainKey) {
+            return try PrivateKey(Array(data))
+        }
+        // `loadProtected` returned nil. Distinguish a genuine absence (first
+        // use → generate) from an existing-but-unreadable item, so we never
+        // silently overwrite a key the device already committed to the server.
+        if keychain.existsProtected(for: self.deviceAuthKeyPairKeychainKey) {
+            throw NSError(domain: "SignalProtocol", code: 500,
+                userInfo: [NSLocalizedDescriptionKey: "Failed to load device-auth key"])
+        }
+        let priv = PrivateKey.generate()
+        guard keychain.saveProtected(data: Data(priv.serialize()), for: self.deviceAuthKeyPairKeychainKey) else {
+            throw NSError(domain: "SignalProtocol", code: 500,
+                userInfo: [NSLocalizedDescriptionKey: "Failed to persist device-auth key"])
+        }
+        return priv
     }
 
     // Shared identity-setup path used both by `initializeIdentity` (fresh
@@ -1303,6 +1339,26 @@ public class SignalProtocolModule: Module {
             let signature = localUser.identityKey.privateKey.generateSignature(message: dataToSign)
             let signatureBase64 = signature.base64EncodedString()
             return ["signature": signatureBase64]
+        }
+
+        // ADR-0010: expose the public half of this device's server-auth key
+        // (libsignal Curve25519, 33B type-prefixed). Registered via POST /keys.
+        AsyncFunction("getDeviceAuthPublicKey") { () -> [String: Any] in
+            let priv = try self.loadOrCreateDeviceAuthPrivateKey()
+            return ["publicKey": Data(priv.publicKey.serialize()).base64EncodedString()]
+        }
+
+        // ADR-0010: sign the (same domain-separated) auth challenge with the
+        // device-auth private key. Sent as `deviceAuthSignature` alongside the
+        // identity `challengeSignature` at POST /auth/identity. Same XEdDSA
+        // primitive as `signWithIdentityKey`.
+        AsyncFunction("signWithDeviceAuth") { (dataBase64: String) -> [String: Any] in
+            guard let dataToSign = Data(base64Encoded: dataBase64) else {
+                throw NSError(domain: "SignalProtocol", code: 400, userInfo: [NSLocalizedDescriptionKey: "Invalid base64 data"])
+            }
+            let priv = try self.loadOrCreateDeviceAuthPrivateKey()
+            let signature = priv.generateSignature(message: dataToSign)
+            return ["signature": signature.base64EncodedString()]
         }
 
         // ========== BIOMETRIC/PASSCODE AUTHENTICATION ==========

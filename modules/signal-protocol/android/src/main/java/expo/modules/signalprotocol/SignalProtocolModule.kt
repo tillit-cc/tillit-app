@@ -68,8 +68,41 @@ class SignalProtocolModule : Module() {
     // Keys for storing identity key pair in protected storage
     private val identityKeyPairStorageKey = "local-identity-key-pair"
     private val localUserMetadataStorageKey = "local-user-metadata"
+    // ADR-0010: per-device server-auth credential. A Curve25519 keypair
+    // distinct from the (shared) E2E identity — used ONLY to authenticate
+    // THIS device to the server. The private key never leaves the device and
+    // never enters the E2E protocol. Stored in protected prefs so `clearAll()`
+    // (clearIdentity / resetIdentityState) wipes it too.
+    private val deviceAuthKeyPairStorageKey = "device-auth-key-pair"
 
     private val context get() = appContext.reactContext!!
+
+    // ADR-0010: return the device-auth private key, creating and persisting a
+    // fresh Curve25519 keypair on first access. Lazy creation means this
+    // covers every path uniformly — fresh install, linked device after
+    // provisioning, and existing installs upgrading to a build that has the
+    // device-auth credential — without touching `performIdentitySetup`.
+    // Requires an active unlock window (the key lives in protected storage).
+    private fun loadOrCreateDeviceAuthPrivateKey(): ECPrivateKey {
+        val keystoreHelper = KeystoreHelper.getInstance(context)
+        if (!keystoreHelper.isAuthenticated) {
+            throw Exception("Must call authenticate() first")
+        }
+        keystoreHelper.loadProtected(deviceAuthKeyPairStorageKey)?.let {
+            return ECPrivateKey(it)
+        }
+        // `loadProtected` returned null. Distinguish a genuine absence (first
+        // use → generate) from an existing-but-unreadable item, so we never
+        // silently overwrite a key the device already committed to the server.
+        if (keystoreHelper.existsProtected(deviceAuthKeyPairStorageKey)) {
+            throw Exception("Failed to load device-auth key")
+        }
+        val priv = ECPrivateKey.generate()
+        if (!keystoreHelper.saveProtected(deviceAuthKeyPairStorageKey, priv.serialize())) {
+            throw Exception("Failed to persist device-auth key")
+        }
+        return priv
+    }
 
     // Shared identity-setup path used both by `initializeIdentity` (fresh
     // install or explicit import) and by `consumeProvisioningPayload`
@@ -1185,6 +1218,25 @@ class SignalProtocolModule : Module() {
             val signatureBase64 = Base64.encodeToString(signature, Base64.NO_WRAP)
 
             return@AsyncFunction mapOf("signature" to signatureBase64)
+        }
+
+        // ADR-0010: expose the public half of this device's server-auth key
+        // (libsignal Curve25519, 33B type-prefixed). Registered via POST /keys.
+        AsyncFunction("getDeviceAuthPublicKey") {
+            val priv = loadOrCreateDeviceAuthPrivateKey()
+            val publicKeyBase64 = Base64.encodeToString(priv.getPublicKey().serialize(), Base64.NO_WRAP)
+            return@AsyncFunction mapOf("publicKey" to publicKeyBase64)
+        }
+
+        // ADR-0010: sign the (same domain-separated) auth challenge with the
+        // device-auth private key. Sent as `deviceAuthSignature` alongside the
+        // identity `challengeSignature` at POST /auth/identity. Same XEdDSA
+        // primitive as `signWithIdentityKey`.
+        AsyncFunction("signWithDeviceAuth") { dataBase64: String ->
+            val dataToSign = Base64.decode(dataBase64, Base64.NO_WRAP)
+            val priv = loadOrCreateDeviceAuthPrivateKey()
+            val signature = priv.calculateSignature(dataToSign)
+            return@AsyncFunction mapOf("signature" to Base64.encodeToString(signature, Base64.NO_WRAP))
         }
 
         // ========== BIOMETRIC/PASSCODE AUTHENTICATION ==========

@@ -74,6 +74,14 @@ export interface SignatureResult {
   signature: string;
 }
 
+// ADR-0010: per-device server-auth credential. Returned by
+// `getDeviceAuthPublicKey` — the base64 public half (libsignal Curve25519,
+// 33B type-prefixed) of the device-auth keypair. Distinct from the shared
+// E2E identity; registered with the server via POST /keys.
+export interface DeviceAuthPublicKeyResult {
+  publicKey: string;
+}
+
 export interface SafetyNumberResult {
   safetyNumber: string;
 }

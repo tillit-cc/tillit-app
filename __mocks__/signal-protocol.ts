@@ -307,6 +307,9 @@ const SignalProtocol = {
 
   // Auth
   signWithIdentityKey: jest.fn().mockResolvedValue({ signature: 'mockSignature==' }),
+  // ADR-0010: per-device server-auth credential
+  getDeviceAuthPublicKey: jest.fn().mockResolvedValue({ publicKey: 'mockDeviceAuthPub==' }),
+  signWithDeviceAuth: jest.fn().mockResolvedValue({ signature: 'mockDeviceAuthSig==' }),
 
   // Biometric
   authenticate: jest.fn().mockResolvedValue({ authenticated: true }),

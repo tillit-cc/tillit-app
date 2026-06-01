@@ -11,6 +11,7 @@ import type {
   DecryptResult,
   SessionResult,
   SignatureResult,
+  DeviceAuthPublicKeyResult,
   SafetyNumberResult,
   IdentityCheckResult,
   SenderKeyResult,
@@ -149,6 +150,9 @@ interface SignalProtocolModuleInterface extends NativeModule {
 
   // ===== AUTHENTICATION =====
   signWithIdentityKey(data: string): Promise<SignatureResult>;
+  // ADR-0010: per-device server-auth credential.
+  getDeviceAuthPublicKey(): Promise<DeviceAuthPublicKeyResult>;
+  signWithDeviceAuth(data: string): Promise<SignatureResult>;
 
   // ===== BIOMETRIC/PASSCODE AUTHENTICATION =====
   authenticate(reason?: string): Promise<AuthResult>;
@@ -574,6 +578,25 @@ export const SignalProtocol = {
    */
   signWithIdentityKey: (data: string) =>
     SignalProtocolModule.signWithIdentityKey(data),
+
+  /**
+   * ADR-0010: get the public half of this device's server-auth key. A
+   * libsignal Curve25519 public key (base64, 33B type-prefixed), generated
+   * and persisted on first access. Distinct from the shared E2E identity —
+   * the private half never leaves the device and never enters the E2E
+   * protocol. Registered with the server via POST /keys (`deviceAuthPublicKey`).
+   */
+  getDeviceAuthPublicKey: () => SignalProtocolModule.getDeviceAuthPublicKey(),
+
+  /**
+   * ADR-0010: sign data with the device-auth private key. Used at login to
+   * sign the SAME domain-separated challenge message as `signWithIdentityKey`,
+   * sent as `deviceAuthSignature` alongside the identity `challengeSignature`.
+   * Binds `deviceId` to a key only this device holds, so a linked device can
+   * no longer claim `deviceId: 1` (finding #4).
+   */
+  signWithDeviceAuth: (data: string) =>
+    SignalProtocolModule.signWithDeviceAuth(data),
 
   // ===== BIOMETRIC/PASSCODE AUTHENTICATION =====
 
