@@ -365,6 +365,9 @@ export class SocketService {
     this.socket.on('connect', () => {
       logger.info(`[Socket:${this.serverId}] Connected OK`);
       this.reconnectAttempts = 0;
+      // ADR-0011: a successful connect means the primary is active again (or
+      // this is the primary). Clear any liveness-lock flag — reversible.
+      useServerStore.getState().setPrimaryInactive(this.serverId, false);
       this.updateState(SocketConnectionState.CONNECTED);
     });
 
@@ -380,6 +383,21 @@ export class SocketService {
         logger.warn(`[Socket:${this.serverId}] Banned — updating store and disconnecting`);
         useServerStore.getState().setBanned(this.serverId, true);
         this.disconnect();
+        return;
+      }
+
+      // ADR-0011 liveness lock: a linked device was rejected because the
+      // primary has been idle past the threshold. TEMPORARY and REVERSIBLE —
+      // do NOT disconnect/logout. Flag it for the UI and let socket.io retry.
+      // Recovery is automatic once the primary is back online: a successful
+      // connect clears the flag (see `connect` handler above). Retries here are
+      // bounded by `reconnectionAttempts` (maxReconnectAttempts); if they run
+      // out while the primary is still offline the socket goes CLOSED with the
+      // flag (and badge) left set, and reconnection resumes on the next
+      // foreground (`app-init` ensureSocketsConnected) or a manual reconnect.
+      if (error.message === 'PRIMARY_INACTIVE') {
+        logger.warn(`[Socket:${this.serverId}] Primary inactive (liveness lock) — will keep retrying`);
+        useServerStore.getState().setPrimaryInactive(this.serverId, true);
         return;
       }
 

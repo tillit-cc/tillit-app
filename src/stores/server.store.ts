@@ -12,6 +12,13 @@ interface ServerState {
   connectionStates: Map<number, SocketConnectionState>;
   reconnectAttempts: Map<number, number>;
   bannedServers: Set<number>;
+  /**
+   * ADR-0011 liveness lock: servers that rejected this (linked) device with
+   * `PRIMARY_INACTIVE` because the primary has been idle too long. TEMPORARY
+   * and REVERSIBLE — cleared automatically on the next successful connect once
+   * the primary is back online. Surfaced as a badge, never a logout.
+   */
+  primaryInactiveServers: Set<number>;
 
   // Actions
   setServers: (servers: Server[]) => void;
@@ -21,6 +28,7 @@ interface ServerState {
   setConnectionState: (serverId: number, state: SocketConnectionState) => void;
   setReconnectAttempts: (serverId: number, attempts: number) => void;
   setBanned: (serverId: number, banned: boolean) => void;
+  setPrimaryInactive: (serverId: number, inactive: boolean) => void;
 
   // Selectors
   isAnyConnected: () => boolean;
@@ -28,6 +36,7 @@ interface ServerState {
   getConnectionState: (serverId: number) => SocketConnectionState;
   getReconnectAttempts: (serverId: number) => number;
   isBanned: (serverId: number) => boolean;
+  isPrimaryInactive: (serverId: number) => boolean;
 }
 
 export const useServerStore = create<ServerState>()(
@@ -36,6 +45,7 @@ export const useServerStore = create<ServerState>()(
     connectionStates: new Map(),
     reconnectAttempts: new Map(),
     bannedServers: new Set(),
+    primaryInactiveServers: new Set(),
 
     setServers: (servers) =>
       set((state) => {
@@ -52,6 +62,8 @@ export const useServerStore = create<ServerState>()(
         state.servers = state.servers.filter((s) => s.id !== serverId);
         state.connectionStates.delete(serverId);
         state.reconnectAttempts.delete(serverId);
+        state.bannedServers.delete(serverId);
+        state.primaryInactiveServers.delete(serverId);
       }),
 
     updateServer: (serverId, updates) =>
@@ -84,6 +96,15 @@ export const useServerStore = create<ServerState>()(
         }
       }),
 
+    setPrimaryInactive: (serverId, inactive) =>
+      set((state) => {
+        if (inactive) {
+          state.primaryInactiveServers.add(serverId);
+        } else {
+          state.primaryInactiveServers.delete(serverId);
+        }
+      }),
+
     isAnyConnected: () => {
       const states = get().connectionStates;
       for (const state of states.values()) {
@@ -110,6 +131,10 @@ export const useServerStore = create<ServerState>()(
 
     isBanned: (serverId) => {
       return get().bannedServers.has(serverId);
+    },
+
+    isPrimaryInactive: (serverId) => {
+      return get().primaryInactiveServers.has(serverId);
     },
   }))
 );

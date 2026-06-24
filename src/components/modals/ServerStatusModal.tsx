@@ -71,6 +71,7 @@ export function ServerStatusModal({ visible, onClose }: ServerStatusModalProps) 
   const connectionStates = useServerStore((s) => s.connectionStates);
   const reconnectAttemptsMap = useServerStore((s) => s.reconnectAttempts);
   const bannedServers = useServerStore((s) => s.bannedServers);
+  const primaryInactiveServers = useServerStore((s) => s.primaryInactiveServers);
   const connectionLog = useAppStore((s) => s.connectionLog);
   const isAuthenticated = useAuthStore((s) => s.isAuthenticated);
   const isTokenExpired = useAuthStore((s) => s.isTokenExpired);
@@ -315,6 +316,7 @@ export function ServerStatusModal({ visible, onClose }: ServerStatusModalProps) 
               const httpConfig = HTTP_STATUS_CONFIG[httpStatus];
               const wsConfig = WS_STATUS_CONFIG[wsStatus];
               const isBanned = bannedServers.has(server.id);
+              const isPrimaryInactive = primaryInactiveServers.has(server.id);
 
               return (
                 <View
@@ -341,6 +343,11 @@ export function ServerStatusModal({ visible, onClose }: ServerStatusModalProps) 
                       {isBanned && (
                         <View className="ml-2 bg-red-100 dark:bg-red-900 rounded px-1.5 py-0.5">
                           <Text className="text-xs text-red-700 dark:text-red-300">{t('report.serverInaccessible')}</Text>
+                        </View>
+                      )}
+                      {!isBanned && isPrimaryInactive && (
+                        <View className="ml-2 bg-amber-100 dark:bg-amber-900 rounded px-1.5 py-0.5">
+                          <Text className="text-xs text-amber-700 dark:text-amber-300">{t('serverStatus.primaryInactiveBadge')}</Text>
                         </View>
                       )}
                     </View>
@@ -415,6 +422,13 @@ export function ServerStatusModal({ visible, onClose }: ServerStatusModalProps) 
                   {isBanned && (
                     <Text className="text-xs text-red-500 dark:text-red-400 mt-2">
                       {t('report.serverBanned')}
+                    </Text>
+                  )}
+
+                  {/* ADR-0011 liveness lock — reversible, reconnect the primary */}
+                  {!isBanned && isPrimaryInactive && (
+                    <Text className="text-xs text-amber-600 dark:text-amber-400 mt-2">
+                      {t('serverStatus.primaryInactiveHint')}
                     </Text>
                   )}
 

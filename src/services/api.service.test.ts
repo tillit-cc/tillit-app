@@ -312,17 +312,4 @@ describe('ApiService', () => {
     });
   });
 
-  describe('recoverPrimaryAuthKey', () => {
-    it('posts deviceId=1 with recoverPrimary flag to /keys', async () => {
-      mockAxiosInstance.post.mockResolvedValueOnce({ data: undefined });
-
-      await api.recoverPrimaryAuthKey('newDeviceAuthPub==');
-
-      expect(mockAxiosInstance.post).toHaveBeenCalledWith(
-        '/keys',
-        { deviceId: 1, deviceAuthPublicKey: 'newDeviceAuthPub==', recoverPrimary: true },
-        undefined,
-      );
-    });
-  });
 });

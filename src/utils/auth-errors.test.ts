@@ -4,7 +4,7 @@ import {
   isDeviceAuthRequiredError,
   isDeviceAuthError,
   isDeviceAuthMismatchError,
-  isPrimaryRecoveryNotNeededError,
+  isPrimaryInactiveError,
 } from './auth-errors';
 
 /** Build an Axios-shaped error with a given status + backend error code. */
@@ -67,13 +67,14 @@ describe('auth-errors (ADR-0010 device-auth error detection)', () => {
     });
   });
 
-  describe('isPrimaryRecoveryNotNeededError', () => {
-    it('matches 409 + PRIMARY_RECOVERY_NOT_NEEDED', () => {
-      expect(isPrimaryRecoveryNotNeededError(httpError(409, 'PRIMARY_RECOVERY_NOT_NEEDED'))).toBe(true);
+  describe('isPrimaryInactiveError (ADR-0011 liveness lock)', () => {
+    it('matches 401 + PRIMARY_INACTIVE', () => {
+      expect(isPrimaryInactiveError(httpError(401, 'PRIMARY_INACTIVE'))).toBe(true);
     });
-    it('rejects the device-auth mismatch (different 409 code) and wrong status', () => {
-      expect(isPrimaryRecoveryNotNeededError(httpError(409, 'DEVICE_AUTH_MISMATCH'))).toBe(false);
-      expect(isPrimaryRecoveryNotNeededError(httpError(401, 'PRIMARY_RECOVERY_NOT_NEEDED'))).toBe(false);
+    it('rejects other 401 codes and wrong status', () => {
+      expect(isPrimaryInactiveError(httpError(401, 'DEVICE_AUTH_INVALID'))).toBe(false);
+      expect(isPrimaryInactiveError(httpError(403, 'PRIMARY_INACTIVE'))).toBe(false);
+      expect(isPrimaryInactiveError(httpError(401, 'BANNED'))).toBe(false);
     });
   });
 });

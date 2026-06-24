@@ -16,6 +16,7 @@ import {
   isDeviceAuthError,
   isDeviceAuthRequiredError,
   isDeviceAuthMismatchError,
+  isPrimaryInactiveError,
 } from '@/utils/auth-errors';
 
 const PRIVACY_POLICY_URL = 'https://tillit.cc/privacy-policy.html';
@@ -87,32 +88,16 @@ export default function LoginScreen() {
     setIdentityState,
     setLoadingMessage,
     authenticateWithBackend,
-    recoverPrimaryAuth,
   } = useAuthStore();
 
   const { t } = useTranslation();
   const router = useRouter();
 
-  // ADR-0010 primary recovery: re-bind this device's server-auth key, wiping
-  // all linked devices, then re-login. Only reached after the user confirms
-  // the destructive prompt below.
-  const runPrimaryRecovery = useCallback(async () => {
-    setIdentityState('creating');
-    setLoadingMessage(t('auth.recovering'));
-    try {
-      await recoverPrimaryAuth();
-      logger.info('[Login] Primary recovery complete — navigating to tabs');
-      router.replace('/(tabs)');
-    } catch (error: any) {
-      logger.error('[Login] Primary recovery failed:', describeErrorForLog(error));
-      Alert.alert(t('auth.recoverPrimaryError'), describeErrorForUser(error));
-      setIdentityState('found');
-    }
-  }, [recoverPrimaryAuth, setIdentityState, setLoadingMessage, router, t]);
-
-  // ADR-0010: surface a device-auth login rejection. On the primary device a
-  // DEVICE_AUTH_INVALID is recoverable (re-bind + wipe linked); on a linked
-  // device the only cure is re-pairing, so we just explain.
+  // ADR-0011: surface a device-auth login rejection. There is NO recovery —
+  // losing the device-auth key is unrecoverable server-side. On the primary
+  // device the only path is to recreate the account (the "Create new
+  // identity" action wipes + re-registers). On a linked device the only cure
+  // is re-pairing. Either way we just explain.
   const presentDeviceAuthError = useCallback(
     async (error: any) => {
       logger.warn('[Login] Device-auth rejected:', describeErrorForLog(error));
@@ -120,28 +105,32 @@ export default function LoginScreen() {
         Alert.alert(t('auth.deviceAuthInvalidTitle'), t('auth.deviceAuthRequiredMsg'));
         return;
       }
-      // INVALID or MISMATCH: offer recovery only on the primary device.
+      // INVALID or MISMATCH. Tailor the copy to primary vs linked: the primary
+      // must recreate the account, a linked device re-pairs.
       let isPrimary = false;
       try {
         const pub = await SignalProtocol.getPublicIdentity();
         isPrimary = pub?.deviceId === PRIMARY_DEVICE_ID;
       } catch {
-        // If we can't read the identity, fall back to the explain-only path.
+        // If we can't read the identity, fall back to the linked-device copy.
       }
-      if (isPrimary) {
-        Alert.alert(t('auth.recoverPrimaryTitle'), t('auth.recoverPrimaryMsg'), [
-          { text: t('common.cancel'), style: 'cancel' },
-          {
-            text: t('auth.recoverPrimaryAction'),
-            style: 'destructive',
-            onPress: runPrimaryRecovery,
-          },
-        ]);
-      } else {
-        Alert.alert(t('auth.deviceAuthInvalidTitle'), t('auth.deviceAuthInvalidMsg'));
-      }
+      Alert.alert(
+        t('auth.deviceAuthInvalidTitle'),
+        isPrimary ? t('auth.primaryUnrecoverableMsg') : t('auth.deviceAuthInvalidMsg'),
+      );
     },
-    [t, runPrimaryRecovery],
+    [t],
+  );
+
+  // ADR-0011 liveness lock: a linked device tried to sign in while the primary
+  // has been idle past the server threshold. TEMPORARY and REVERSIBLE — not a
+  // logout/revoke. Tell the user to bring the primary back online and retry.
+  const presentPrimaryInactiveError = useCallback(
+    (error: any) => {
+      logger.warn('[Login] Primary inactive (liveness lock):', describeErrorForLog(error));
+      Alert.alert(t('auth.primaryInactiveTitle'), t('auth.primaryInactiveMsg'));
+    },
+    [t],
   );
 
   // Check local identity on mount
@@ -271,12 +260,16 @@ export default function LoginScreen() {
       if (isBannedError(error)) {
         logger.warn('[Login] User is banned');
         Alert.alert(t('report.serverBanned'), t('auth.accountBanned'));
+      } else if (isPrimaryInactiveError(error)) {
+        // ADR-0011 liveness lock: reversible, not a logout. Identity stays
+        // intact — user retries once the primary is back online.
+        presentPrimaryInactiveError(error);
       } else if (isDeviceAuthError(error) || isDeviceAuthMismatchError(error)) {
-        // ADR-0010: this device's server-auth credential is missing/stale —
-        // 401 at login (INVALID/REQUIRED) or 409 at /keys (MISMATCH: the
-        // server has a different device-auth key bound). On the primary,
-        // `presentDeviceAuthError` offers the recovery flow; on a linked
-        // device it explains the re-pair path.
+        // ADR-0010/0011: this device's server-auth credential is missing/stale
+        // — 401 at login (INVALID/REQUIRED) or 409 at /keys (MISMATCH: the
+        // server has a different device-auth key bound). No recovery: on the
+        // primary the cure is recreating the account, on a linked device it is
+        // re-pairing. `presentDeviceAuthError` explains the right path.
         await presentDeviceAuthError(error);
       } else {
         logger.error('[Login] continueWithExisting error:', describeErrorForLog(error));
@@ -287,7 +280,7 @@ export default function LoginScreen() {
       }
       setIdentityState('found');
     }
-  }, [authenticateWithBackend, readKeyMaterial, syncPublicKeys, setIdentityState, setLoadingMessage, router, presentDeviceAuthError, t]);
+  }, [authenticateWithBackend, readKeyMaterial, syncPublicKeys, setIdentityState, setLoadingMessage, router, presentDeviceAuthError, presentPrimaryInactiveError, t]);
 
   // Wipe all data and create new identity
   const wipeAndCreate = useCallback(async () => {

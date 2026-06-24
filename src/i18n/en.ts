@@ -53,16 +53,15 @@ export default {
     noServerResponse: '(no response from server)',
     identityCreateError: 'Error creating identity.',
     deleteError: 'Error deleting',
-    // ADR-0010: per-device server-auth
+    // ADR-0010/0011: per-device server-auth
     deviceAuthInvalidTitle: 'Device verification failed',
-    deviceAuthInvalidMsg: 'This device is no longer recognised by the server. To sign in again you will need to reset your identity (all linked devices will be unlinked) or re-link this device.',
+    deviceAuthInvalidMsg: 'This device is no longer recognised by the server. To sign in again you will need to re-link this device from your primary device.',
     deviceAuthRequiredMsg: 'This server requires device keys to be registered before sign-in. Please retry; if the error persists, reset your identity.',
-    // ADR-0010: primary recovery
-    recoverPrimaryTitle: 'Restore access',
-    recoverPrimaryMsg: 'This primary device is no longer recognised by the server. Restoring access will unlink ALL linked devices, which will need to be paired again. Continue?',
-    recoverPrimaryAction: 'Restore',
-    recovering: 'Restoring access...',
-    recoverPrimaryError: 'Failed to restore access.',
+    // ADR-0011: no primary recovery — the account must be recreated
+    primaryUnrecoverableMsg: 'Your primary device is no longer recognised by the server and cannot be recovered. To continue you must create a new identity: local data will be erased and any linked devices will need to be paired again. Use "Create new identity".',
+    // ADR-0011: liveness lock — temporary and reversible
+    primaryInactiveTitle: 'Primary device inactive',
+    primaryInactiveMsg: 'To unlock this device, reconnect your primary device. As soon as it comes back online you can sign in here again — no re-pairing needed.',
     // Alerts
     newIdentityTitle: 'New identity',
     newIdentityMsg: 'All local data will be deleted. Continue?',
@@ -334,6 +333,8 @@ export default {
     main: 'Main',
     reconnectAttempts: 'Reconnect attempts: {{count}}',
     reconnect: 'Reconnect',
+    primaryInactiveBadge: 'Waiting for primary',
+    primaryInactiveHint: 'Reconnect your primary device to unlock this device. We will keep retrying automatically.',
     diagnosticLog: 'Diagnostic log',
     discoveredServers: 'Servers found on network',
     connectBtn: 'Connect',

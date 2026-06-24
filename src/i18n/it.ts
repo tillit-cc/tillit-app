@@ -53,16 +53,15 @@ export default {
     noServerResponse: '(nessuna risposta dal server)',
     identityCreateError: "Errore nella creazione dell'identità.",
     deleteError: "Errore nell'eliminazione",
-    // ADR-0010: per-device server-auth
+    // ADR-0010/0011: per-device server-auth
     deviceAuthInvalidTitle: 'Verifica dispositivo fallita',
-    deviceAuthInvalidMsg: 'Questo dispositivo non è più riconosciuto dal server. Per accedere di nuovo dovrai reimpostare l\'identità (verranno scollegati tutti i dispositivi collegati) oppure ri-collegare questo dispositivo.',
+    deviceAuthInvalidMsg: 'Questo dispositivo non è più riconosciuto dal server. Per accedere di nuovo dovrai ri-collegare questo dispositivo dal dispositivo principale.',
     deviceAuthRequiredMsg: 'Questo server richiede la registrazione delle chiavi del dispositivo prima dell\'accesso. Riprova; se l\'errore persiste, reimposta l\'identità.',
-    // ADR-0010: primary recovery
-    recoverPrimaryTitle: 'Ripristina accesso',
-    recoverPrimaryMsg: 'Questo dispositivo principale non è più riconosciuto dal server. Ripristinando l\'accesso, TUTTI i dispositivi collegati verranno scollegati e dovranno essere ri-associati. Continuare?',
-    recoverPrimaryAction: 'Ripristina',
-    recovering: 'Ripristino accesso...',
-    recoverPrimaryError: 'Ripristino dell\'accesso fallito.',
+    // ADR-0011: nessun recovery del primary — va ricreato l'account
+    primaryUnrecoverableMsg: 'Il dispositivo principale non è più riconosciuto dal server e non può essere recuperato. Per continuare devi creare una nuova identità: i dati locali verranno eliminati e dovrai ri-associare gli altri dispositivi. Usa "Crea nuova identità".',
+    // ADR-0011: liveness lock — stato temporaneo e reversibile
+    primaryInactiveTitle: 'Dispositivo principale inattivo',
+    primaryInactiveMsg: 'Per sbloccare questo dispositivo, riconnetti il dispositivo principale. Appena tornerà online potrai accedere di nuovo da qui — non serve ri-associare nulla.',
     // Alerts
     newIdentityTitle: 'Nuova identità',
     newIdentityMsg: 'Tutti i dati locali verranno eliminati. Continuare?',
@@ -338,6 +337,8 @@ export default {
     main: 'Principale',
     reconnectAttempts: 'Tentativi riconnessione: {{count}}',
     reconnect: 'Riconnetti',
+    primaryInactiveBadge: 'In attesa del principale',
+    primaryInactiveHint: 'Riconnetti il dispositivo principale per sbloccare questo dispositivo. Riproveremo automaticamente.',
     diagnosticLog: 'Log diagnostico',
     discoveredServers: 'Server trovati sulla rete',
     connectBtn: 'Collega',
