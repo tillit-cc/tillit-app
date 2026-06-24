@@ -154,7 +154,9 @@ class KeychainHelper {
         }
 
         let context = LAContext()
-        context.evaluateAccessControl(accessControl, operation: .useItem, localizedReason: reason) { [weak self] success, authError in
+
+        // Shared result handling for both evaluation paths below.
+        let handleResult: (Bool, Error?) -> Void = { [weak self] success, authError in
             guard let self = self else { return }
 
             self.queue.sync {
@@ -188,6 +190,22 @@ class KeychainHelper {
                 }
             }
         }
+
+        #if targetEnvironment(simulator)
+        // The iOS Simulator does not emulate the Secure Enclave, so
+        // `evaluateAccessControl` against a `.userPresence` SecAccessControl
+        // fails even when Face ID is enrolled. Fall back to the generic
+        // `evaluatePolicy(.deviceOwnerAuthentication)`, which the simulator
+        // supports. The `evaluateAccessControl` path exists only to avoid the
+        // iOS 17/18 keychain re-prompt on real devices — irrelevant here.
+        _ = accessControl
+        context.touchIDAuthenticationAllowableReuseDuration = LATouchIDAuthenticationMaximumAllowableReuseDuration
+        context.evaluatePolicy(.deviceOwnerAuthentication, localizedReason: reason, reply: handleResult)
+        #else
+        // Authenticate the LAContext directly against the SecAccessControl that
+        // protects our items, so subsequent Keychain reads/writes don't re-prompt.
+        context.evaluateAccessControl(accessControl, operation: .useItem, localizedReason: reason, reply: handleResult)
+        #endif
     }
 
     private func parseAuthError(_ error: Error?) -> String {
