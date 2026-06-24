@@ -170,12 +170,28 @@ export default function LoginScreen() {
     checkIdentity();
   }, [setIdentityState, setLoadingMessage]);
 
-  // Sync public keys to server
-  const syncPublicKeys = useCallback(async () => {
+  // Read all protected-storage key material (the public bundle + the
+  // ADR-0010 device-auth public key). MUST be called while the biometric
+  // unlock window is open and BEFORE `authenticateWithBackend` flips
+  // `isAuthenticated`: that flip triggers navigation to /(tabs) →
+  // appInitService.initialize(), whose `registerPush` step pops the Android 13+
+  // notification-permission dialog, backgrounding the app and locking the
+  // keystore (app-init.service.ts handleAppStateChange → SignalProtocol.lock()).
+  // If the read happened after the flip it raced that lock and threw
+  // "Must call authenticate() first" on getDeviceAuthPublicKey.
+  const readKeyMaterial = useCallback(async () => {
     const bundle = await SignalProtocol.getFullPublicBundle();
     // ADR-0010: register this device's server-auth public key alongside the
     // bundle (TOFU-bound server-side on first upload, idempotent after).
     const { publicKey: deviceAuthPublicKey } = await SignalProtocol.getDeviceAuthPublicKey();
+    return { bundle, deviceAuthPublicKey };
+  }, []);
+
+  // Sync public keys to server. Takes pre-read key material so no protected
+  // storage is touched here — see `readKeyMaterial` for why that matters.
+  const syncPublicKeys = useCallback(async (
+    { bundle, deviceAuthPublicKey }: Awaited<ReturnType<typeof readKeyMaterial>>,
+  ) => {
     const payload = {
       deviceId: bundle.deviceId,
       registrationId: bundle.registrationId,
@@ -230,6 +246,10 @@ export default function LoginScreen() {
       }
       await delay(300);
 
+      // Read key material while the unlock window is still open, before the
+      // authenticateWithBackend flip kicks off appInit (see readKeyMaterial).
+      const keyMaterial = await readKeyMaterial();
+
       // Authenticate with backend (challenge-response)
       // If default server is banned but returns userId, authenticateWithBackend
       // handles it internally (sets isAuthenticated=true, marks server banned).
@@ -239,7 +259,7 @@ export default function LoginScreen() {
 
       // Sync public keys
       setLoadingMessage(t('auth.syncingKeys'));
-      await syncPublicKeys();
+      await syncPublicKeys(keyMaterial);
       await delay(300);
 
       logger.info('[Login] Login complete - navigating to tabs');
@@ -267,7 +287,7 @@ export default function LoginScreen() {
       }
       setIdentityState('found');
     }
-  }, [authenticateWithBackend, syncPublicKeys, setIdentityState, setLoadingMessage, router, presentDeviceAuthError, t]);
+  }, [authenticateWithBackend, readKeyMaterial, syncPublicKeys, setIdentityState, setLoadingMessage, router, presentDeviceAuthError, t]);
 
   // Wipe all data and create new identity
   const wipeAndCreate = useCallback(async () => {
@@ -329,6 +349,13 @@ export default function LoginScreen() {
       logger.info('[Login] Identity initialized');
       await delay(300);
 
+      // Phase 3b: Read key material now — the unlock window is open and no
+      // navigation/appInit has been triggered yet. Doing this before Phase 4
+      // avoids the lock race that broke getDeviceAuthPublicKey (see
+      // readKeyMaterial). This also lazily generates the device-auth keypair,
+      // which authenticateWithBackend's signWithDeviceAuth then reuses.
+      const keyMaterial = await readKeyMaterial();
+
       // Phase 4: Authenticate with backend
       setLoadingMessage(t('auth.registeringIdentity'));
       await authenticateWithBackend();
@@ -336,7 +363,7 @@ export default function LoginScreen() {
 
       // Phase 5: Sync public keys
       setLoadingMessage(t('auth.syncingKeys'));
-      await syncPublicKeys();
+      await syncPublicKeys(keyMaterial);
       await delay(300);
 
       logger.info('[Login] Identity created successfully - navigating to tabs');
@@ -355,7 +382,7 @@ export default function LoginScreen() {
         setIdentityState('not_found');
       }
     }
-  }, [authenticateWithBackend, syncPublicKeys, setIdentityState, setLoadingMessage, router]);
+  }, [authenticateWithBackend, readKeyMaterial, syncPublicKeys, setIdentityState, setLoadingMessage, router]);
 
   // Create new identity with confirmation (when existing identity found)
   const createNewIdentity = useCallback(async () => {
