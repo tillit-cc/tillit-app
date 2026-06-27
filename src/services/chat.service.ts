@@ -38,6 +38,8 @@ import { logger } from '@/utils/logger';
 import { generateThumbnailFromBase64, generateMicroThumbnailFromBase64, generateColorPreviewFromBase64, saveImageToFile, deleteImagesByMessageIds, readImageAsBase64 } from '@/utils/image';
 import { readFileAsBase64, saveFileToCache, deleteFilesByMessageIds, fileExists, resolveFilePath, MAX_FILE_SIZE } from '@/utils/file';
 import { toLocalRoomId, toBackendRoomId, getServerIdFromRoomId } from '@/utils/server-id';
+import { signalAddressNameForRoom } from '@/utils/signal-address';
+import { diagnostics } from './diagnostics.service';
 
 class ChatService {
   private initialized = false;
@@ -1350,6 +1352,11 @@ class ChatService {
     for (const remoteUserId of uniquePeerUserIds) {
       await sessionService.ensureSession(roomId, Number(remoteUserId));
 
+      // Server-namespaced libsignal address (frontend-0027). Only the string
+      // handed to the native module is namespaced — the `recipients[]` wire
+      // shape and the SQLite session rows keep the bare server-local userId.
+      const peerAddrName = signalAddressNameForRoom(roomId, remoteUserId);
+
       // Multi-device fan-out: encrypt one ciphertext per (userId, deviceId).
       // Fall back to [PRIMARY_DEVICE_ID] when we have no device list yet
       // (single-device peer or pre-multi-device cache state).
@@ -1380,7 +1387,7 @@ class ChatService {
         try {
           const { encryptedMessage } = await SignalProtocol.encryptMessage(
             encodeURIComponent(message),
-            remoteUserId,
+            peerAddrName,
             deviceId,
           );
           logger.info('[ChatService] encrypt: encrypted for', remoteUserId + '/' + deviceId, 'OK, length:', encryptedMessage?.length);
@@ -1420,7 +1427,7 @@ class ChatService {
           try {
             const { encryptedMessage } = await SignalProtocol.encryptMessage(
               encodeURIComponent(message),
-              remoteUserId,
+              peerAddrName,
               PRIMARY_DEVICE_ID,
             );
             recipients.push({
@@ -1475,7 +1482,7 @@ class ChatService {
           }
           const { encryptedMessage } = await SignalProtocol.encryptMessage(
             encodeURIComponent(message),
-            ownUserId,
+            signalAddressNameForRoom(roomId, ownUserId),
             deviceId,
           );
           recipients.push({ userId: Number(ownUserId), deviceId, ciphertext: encryptedMessage });
@@ -1575,7 +1582,11 @@ class ChatService {
 
       logger.info(`[ChatService][User:${globalUserId}] decrypt: from user ${remoteUserId}/${effectiveDeviceId ?? 1}, room ${roomId}, bodyLen: ${body?.length}`);
 
-      const decryptResult = await SignalProtocol.decryptMessage(body, remoteUserId, effectiveDeviceId);
+      // Server-namespaced libsignal address (frontend-0027): the native
+      // session/identity store is keyed per-server, so we must look up the
+      // sender under the room's server namespace, not the bare userId.
+      const addrName = signalAddressNameForRoom(roomId, remoteUserId);
+      const decryptResult = await SignalProtocol.decryptMessage(body, addrName, effectiveDeviceId);
 
       logger.info(`[ChatService][User:${globalUserId}] decrypt: SUCCESS from user ${remoteUserId}`);
 
@@ -2664,8 +2675,15 @@ class ChatService {
             perDeviceRecipients = encrypted.recipients;
           }
           logger.info('[ChatService] sendControlPacket: encrypted OK, senderKey:', !!encrypted.senderKey, 'perDevice:', perDeviceRecipients?.length ?? 0);
-        } catch (error) {
+        } catch (error: any) {
           logger.error('[ChatService] Control packet encryption failed, dropping packet:', error);
+          diagnostics.error('controlPacket', 'drop', {
+            serverId: getServerIdFromRoomId(roomId),
+            roomId,
+            type,
+            reason: 'encrypt-failed',
+            errName: error?.name ?? null,
+          });
           return false;
         }
       } else {
@@ -2693,6 +2711,12 @@ class ChatService {
       const socket = serverRegistry.getSocketForRoom(roomId);
       if (!socket.isConnected()) {
         logger.warn('[ChatService] sendControlPacket: socket NOT connected, dropping packet');
+        diagnostics.warn('controlPacket', 'drop', {
+          serverId: getServerIdFromRoomId(roomId),
+          roomId,
+          type,
+          reason: 'socket-not-connected',
+        });
         return;
       }
       const backendRoomId = toBackendRoomId(roomId);
@@ -2719,26 +2743,54 @@ class ChatService {
             version: envelope.version,
           },
         }));
+        diagnostics.event('controlPacket', 'sent', {
+          serverId: getServerIdFromRoomId(roomId),
+          roomId,
+          type,
+          path: 'fanout',
+          recipients: fanoutRecipients.length,
+        });
         socket
           .sendPacket({ roomId: backendRoomId, recipients: fanoutRecipients, volatile: isVolatile })
           .then((result) => {
             logger.info('[ChatService] sendControlPacket: fan-out sent, result:', JSON.stringify(result));
           })
-          .catch((error) => {
+          .catch((error: any) => {
             logger.error('[ChatService] sendControlPacket fan-out network error:', error);
+            diagnostics.error('controlPacket', 'sendError', {
+              serverId: getServerIdFromRoomId(roomId),
+              roomId,
+              type,
+              path: 'fanout',
+              errName: error?.name ?? null,
+            });
           });
         return;
       }
 
       // Legacy path: single envelope, broadcast by userId. Used by the
       // sender-key encrypted ramo and the unencrypted body ramo.
+      diagnostics.event('controlPacket', 'sent', {
+        serverId: getServerIdFromRoomId(roomId),
+        roomId,
+        type,
+        path: 'legacy',
+        toUserId: toUserId ?? null,
+      });
       socket
         .sendPacket(backendRoomId, envelope, toUserId ? [toUserId] : undefined, isVolatile)
         .then((result) => {
           logger.info('[ChatService] sendControlPacket: sent, result:', JSON.stringify(result));
         })
-        .catch((error) => {
+        .catch((error: any) => {
           logger.error('[ChatService] sendControlPacket network error:', error);
+          diagnostics.error('controlPacket', 'sendError', {
+            serverId: getServerIdFromRoomId(roomId),
+            roomId,
+            type,
+            path: 'legacy',
+            errName: error?.name ?? null,
+          });
         });
     };
 

@@ -28,7 +28,7 @@ src/
   stores/            # auth.store, chat.store, app.store, server.store, device.store
   services/          # api, chat (~1550 righe, core), socket, session, sender-key, queue,
                      # app-init, health-check, device, tor, tor-axios-adapter, tor-websocket,
-                     # server-registry
+                     # server-registry, diagnostics
   db/                # schema.ts, client.ts (createTables + applyMigrations), repositories/
   hooks/, utils/, types/, i18n/
 
@@ -102,8 +102,9 @@ Due livelli in `src/db/client.ts`: `createTables()` con `CREATE TABLE IF NOT EXI
 
 ## Convenzioni
 
-- **Logger**: `import { logger } from '@/utils/logger'`. Mai `console.log`. Output su console + Zustand `app.store.connectionLog` (max 200), visibile via 10-tap sull'icona connessione.
-- **Singleton services**: `apiService`, `chatService`, `socketService`, `sessionService`, `senderKeyService`, `queueService`, `appInitService`, `healthCheckService`, `deviceService`, `torService`.
+- **Logger**: `import { logger } from '@/utils/logger'`. Mai `console.log`. Output su console + Zustand `app.store.connectionLog` (max 200), visibile via 10-tap sull'icona connessione. Quando i log diagnostici on-device sono ON, il logger inoltra ogni riga (già sanitizzata) al ring buffer di `diagnostics` via `setDiagSink`.
+- **Diagnostica on-device (frontend-0028)**: `diagnostics` singleton (`services/diagnostics.service.ts`) — opt-in (toggle in Impostazioni, default OFF, **zero backend**). Ring buffer persistente bounded (2000 entry / 24h, `documentDirectory/diagnostics/buffer.jsonl`) di entry strutturate `{ts, level, category, event, ctx}` con `serverId` nel ctx. Strumentati: auth + keystore unlock (`server-registry`), session establish + `identityMismatch` (`session.service`), control packet sent/drop (`chat.service`), socket connect/disconnect/error (`socket.service`). **Redazione**: `utils/diag-redact.ts` (`redactCtx` in ingresso + `reRedactText` in export) elimina token base64/hex/JWT lunghi — mai chiavi, ciphertext, token o contenuti. Export via share sheet (re-redaction finale), wipe. Init in `appInitService.initialize` (step 0). Solo identificatori/metadati: vedi regole nella spec.
+- **Singleton services**: `apiService`, `chatService`, `socketService`, `sessionService`, `senderKeyService`, `queueService`, `appInitService`, `healthCheckService`, `deviceService`, `torService`, `diagnostics`.
 - **Repository pattern**: accesso DB solo via `src/db/repositories/`.
 - **Stores**: `useAuthStore`, `useAppStore`, `useChatStore`, `useServerStore`, `useDeviceStore`. Fuori dai componenti: `useStore.getState()`.
 - **Serial queue (`chatService.messageQueue`)**: serializza **tutte** le op Signal Protocol. Il native NON è thread-safe — concorrenza corrompe il ratchet. NON rimuovere.

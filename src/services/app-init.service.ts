@@ -15,6 +15,7 @@ import { useChatStore } from '@/stores/chat.store';
 import { messageRepository } from '@/db/repositories/message.repository';
 import { healthCheckService } from './health-check.service';
 import { torService } from './tor.service';
+import { diagnostics } from './diagnostics.service';
 
 class AppInitService {
   private initialized = false;
@@ -48,6 +49,10 @@ class AppInitService {
     }
 
     logger.info('[AppInit] Starting bootstrap...');
+
+    // --- Step 0: Wire on-device diagnostics (opt-in, no-op when OFF) ---
+    // Done first so the logger transport captures the whole bootstrap.
+    await diagnostics.init();
 
     // --- Step 0a: Initialize encrypted database (mandatory) ---
     logger.info('[AppInit] Step 0a: Initializing encrypted database...');
@@ -347,6 +352,9 @@ class AppInitService {
       // notification center) which would cancel in-flight connections.
       this.lastBackground = Date.now();
       appStore.setInBackground(true);
+
+      // Persist any buffered diagnostics before the OS may suspend us.
+      diagnostics.onBackground();
 
       serverRegistry.disconnectAll();
       logger.info('[AppInit] All sockets disconnected (background)');

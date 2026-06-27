@@ -1,5 +1,5 @@
 import { useState, useEffect, useRef, useCallback } from 'react';
-import { View, Text, ScrollView, TextInput, Alert, Linking, Pressable, ActivityIndicator } from 'react-native';
+import { View, Text, ScrollView, TextInput, Alert, Linking, Pressable, ActivityIndicator, Switch, Platform } from 'react-native';
 import { SafeAreaView } from 'react-native-safe-area-context';
 import { Ionicons } from '@expo/vector-icons';
 import { useTranslation } from 'react-i18next';
@@ -10,11 +10,13 @@ import { useAppStore } from '@/stores/app.store';
 import { useDeviceStore } from '@/stores/device.store';
 import { appInitService } from '@/services/app-init.service';
 import { deviceService } from '@/services/device.service';
+import { diagnostics } from '@/services/diagnostics.service';
 import { profileRepository } from '@/db/repositories/profile.repository';
 import { logger } from '@/utils/logger';
 import type { DeviceInfo } from '@/types/device';
 import * as Application from 'expo-application';
 import * as Updates from 'expo-updates';
+import * as Sharing from 'expo-sharing';
 
 const PRIVACY_POLICY_URL = 'https://tillit.cc/privacy-policy.html';
 
@@ -137,6 +139,70 @@ export default function ProfileScreen() {
     },
     [t],
   );
+
+  // ===== Diagnostic logging (frontend-0028) =====
+  const [diagEnabled, setDiagEnabled] = useState(false);
+  const [diagBusy, setDiagBusy] = useState(false);
+
+  useEffect(() => {
+    diagnostics
+      .init()
+      .then(() => setDiagEnabled(diagnostics.isEnabled()))
+      .catch((err) => logger.warn('[Profile] diagnostics init failed:', err?.message ?? err));
+  }, []);
+
+  const handleToggleDiag = useCallback(async (value: boolean) => {
+    setDiagEnabled(value);
+    try {
+      await diagnostics.setEnabled(value);
+    } catch (err) {
+      logger.warn('[Profile] setEnabled failed:', err);
+      setDiagEnabled(diagnostics.isEnabled());
+    }
+  }, []);
+
+  const handleExportDiag = useCallback(async () => {
+    setDiagBusy(true);
+    try {
+      const result = await diagnostics.export();
+      if (!result) {
+        Alert.alert(t('diagnostics.title'), t('diagnostics.emptyMsg'));
+        return;
+      }
+      const canShare = await Sharing.isAvailableAsync();
+      if (!canShare) {
+        Alert.alert(t('common.error'), t('diagnostics.shareUnavailable'));
+        return;
+      }
+      await Sharing.shareAsync(result.uri, {
+        mimeType: 'text/plain',
+        dialogTitle: t('diagnostics.shareTitle'),
+        UTI: 'public.plain-text',
+      });
+    } catch (err) {
+      logger.warn('[Profile] export diagnostics failed:', err);
+      Alert.alert(t('common.error'), t('diagnostics.exportError'));
+    } finally {
+      setDiagBusy(false);
+    }
+  }, [t]);
+
+  const handleWipeDiag = useCallback(() => {
+    Alert.alert(t('diagnostics.wipeTitle'), t('diagnostics.wipeMsg'), [
+      { text: t('common.cancel'), style: 'cancel' },
+      {
+        text: t('diagnostics.wipe'),
+        style: 'destructive',
+        onPress: async () => {
+          try {
+            await diagnostics.wipe();
+          } catch (err) {
+            logger.warn('[Profile] wipe diagnostics failed:', err);
+          }
+        },
+      },
+    ]);
+  }, [t]);
 
   const handleDeleteAccount = useCallback(() => {
     Alert.alert(
@@ -324,6 +390,53 @@ export default function ProfileScreen() {
             </View>
             <Ionicons name="open-outline" size={18} color="#9ca3af" />
           </Pressable>
+        </View>
+
+        {/* Diagnostics Section */}
+        <View className="mt-4 bg-white dark:bg-gray-900 px-4 py-3">
+          <Text className="text-xs font-semibold text-gray-500 dark:text-gray-400 uppercase tracking-wide mb-1">
+            {t('diagnostics.section')}
+          </Text>
+          <Text className="text-xs text-gray-400 dark:text-gray-500 mb-3">
+            {t('diagnostics.sectionDescription')}
+          </Text>
+
+          <View className="flex-row items-center justify-between py-2">
+            <Text className="text-base text-gray-900 dark:text-white flex-1 mr-3">
+              {t('diagnostics.toggle')}
+            </Text>
+            <Switch
+              value={diagEnabled}
+              onValueChange={handleToggleDiag}
+              trackColor={{ false: '#d1d5db', true: '#2ad1af' }}
+              thumbColor={Platform.OS === 'android' ? '#ffffff' : undefined}
+            />
+          </View>
+
+          {diagEnabled ? (
+            <View className="mt-3" style={{ gap: 8 }}>
+              <Button
+                onPress={handleExportDiag}
+                variant="outline"
+                size="md"
+                disabled={diagBusy}
+                icon={<Ionicons name="share-outline" size={20} color="#3b82f6" />}
+              >
+                <Text className="text-blue-500 font-semibold">
+                  {diagBusy ? t('diagnostics.exporting') : t('diagnostics.export')}
+                </Text>
+              </Button>
+              <Button
+                onPress={handleWipeDiag}
+                variant="ghost"
+                size="md"
+                disabled={diagBusy}
+                icon={<Ionicons name="trash-outline" size={20} color="#ef4444" />}
+              >
+                <Text className="text-red-500 font-semibold">{t('diagnostics.wipe')}</Text>
+              </Button>
+            </View>
+          ) : null}
         </View>
 
         {/* Logout Section */}

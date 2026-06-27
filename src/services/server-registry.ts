@@ -11,6 +11,7 @@ import { torService } from './tor.service';
 import { isOnionUrl } from './tor-axios-adapter';
 import { buildChallengeMessageBase64 } from '@/utils/challenge';
 import { isDeviceAuthMismatchError } from '@/utils/auth-errors';
+import { diagnostics } from './diagnostics.service';
 import * as SecureStore from 'expo-secure-store';
 
 export class ServerRegistry {
@@ -19,6 +20,9 @@ export class ServerRegistry {
   private serverMap = new Map<number, Server>();
   private reauthInProgress = new Set<number>();
   private serverAddedCallbacks: ((serverId: number) => void)[] = [];
+  // Coalesces concurrent keystore unlocks so parallel server auths
+  // (connectAll) never stack multiple biometric prompts. See ensureKeystoreUnlocked.
+  private unlockInFlight: Promise<void> | null = null;
 
   /**
    * Injected callbacks to break the require cycle with auth.store.
@@ -450,6 +454,28 @@ export class ServerRegistry {
    * Authenticate with a server using challenge-response (same identity key).
    */
   private async authenticateServer(serverId: number): Promise<void> {
+    const startedAt = Date.now();
+    diagnostics.event('auth', 'authenticate.start', { serverId });
+    try {
+      await this.authenticateServerInner(serverId);
+      diagnostics.event('auth', 'authenticate.ok', {
+        serverId,
+        durMs: Date.now() - startedAt,
+      });
+    } catch (error: any) {
+      diagnostics.error('auth', 'authenticate.fail', {
+        serverId,
+        durMs: Date.now() - startedAt,
+        errName: error?.name ?? null,
+        errMsg: error?.message ?? null,
+        httpStatus: error?.response?.status ?? null,
+        serverError: error?.response?.data?.error ?? null,
+      });
+      throw error;
+    }
+  }
+
+  private async authenticateServerInner(serverId: number): Promise<void> {
     const SignalProtocol = require('signal-protocol').default;
     const api = this.getApi(serverId);
 
@@ -461,6 +487,15 @@ export class ServerRegistry {
     if (!challengeResponse?.challengeId || !challengeResponse?.nonce) {
       throw new Error('Invalid challenge response');
     }
+
+    // ADR-0010: signWithDeviceAuth (below) reads the device-auth key from
+    // protected storage, which requires an active keystore unlock window.
+    // signWithIdentityKey works off the in-memory localUser even when the
+    // window is closed, but signWithDeviceAuth would throw "Must call
+    // authenticate() first". Multi-server paths (addServer, reconnect,
+    // auto-auth on connect) can reach here after the window lapsed — e.g.
+    // while Tor bootstraps. Re-open it before signing.
+    await this.ensureKeystoreUnlocked();
 
     // Sign with domain-separated message — see src/utils/challenge.ts
     const challengeMessage = buildChallengeMessageBase64(challengeResponse.nonce, api.baseUrl);
@@ -511,6 +546,60 @@ export class ServerRegistry {
       useServerStore.getState().updateServer(serverId, { userId: response.userId });
       logger.info(`[ServerRegistry] Server ${serverId} userId: ${response.userId}`);
     }
+  }
+
+  /**
+   * Ensure an active keystore unlock window before signing the server-auth
+   * challenge.
+   *
+   * The device-auth key (ADR-0010) lives in protected storage and is only
+   * readable while the keystore is unlocked; `signWithDeviceAuth` throws
+   * "Must call authenticate() first" otherwise. The shared E2E identity used
+   * by `signWithIdentityKey` is held in memory and is NOT subject to this,
+   * which is why identity signing succeeds while device-auth signing fails on
+   * the same call.
+   *
+   * If already unlocked we just refresh the window (touch); otherwise we
+   * re-open it via biometric/passcode. Concurrent callers (connectAll
+   * authenticates every server in parallel) share a single in-flight unlock so
+   * we never stack multiple prompts.
+   */
+  private async ensureKeystoreUnlocked(): Promise<void> {
+    const SignalProtocol = require('signal-protocol').default;
+
+    try {
+      const { authenticated } = SignalProtocol.isAuthenticated();
+      if (authenticated) {
+        // Refresh the window so a slow auth flow (e.g. challenge over Tor)
+        // doesn't expire between this check and signWithDeviceAuth.
+        SignalProtocol.extendAuthentication();
+        return;
+      }
+    } catch (error) {
+      logger.warn('[ServerRegistry] isAuthenticated check failed, attempting unlock:', error);
+    }
+
+    if (!this.unlockInFlight) {
+      this.unlockInFlight = (async () => {
+        logger.info('[ServerRegistry] Keystore locked — requesting unlock before server auth');
+        diagnostics.event('keystore', 'unlock.request');
+        const result = await SignalProtocol.authenticate(
+          'Sblocca le chiavi per autenticarti con il server'
+        );
+        if (!result?.success) {
+          diagnostics.error('keystore', 'unlock.fail', { errMsg: result?.error ?? null });
+          throw new Error(
+            'Keystore unlock required for server authentication: ' +
+              (result?.error || 'authentication failed')
+          );
+        }
+        diagnostics.event('keystore', 'unlock.ok');
+      })().finally(() => {
+        this.unlockInFlight = null;
+      });
+    }
+
+    await this.unlockInFlight;
   }
 
   /**

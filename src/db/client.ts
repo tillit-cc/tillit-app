@@ -255,6 +255,29 @@ const MIGRATIONS: { version: number; statements: string[] }[] = [
       'ALTER TABLE session ADD COLUMN remote_known_devices TEXT',
     ],
   },
+  {
+    // Per-server libsignal store namespacing (frontend-0027). The native
+    // session/identity store is now keyed by a server-namespaced address
+    // name: bare userId for the default server (serverId 0), `serverId:userId`
+    // for every other server. The DEFAULT server keeps the bare key, so its
+    // existing native entries — and the session rows pointing at them — stay
+    // valid: mono-server chats are untouched.
+    //
+    // For NON-default servers the namespaced address starts empty. A stale
+    // session row there would make the strict identity-trust check
+    // (assertIdentityNotChanged) read "row exists but native has no identity"
+    // and raise a FALSE IdentityKeyMismatchError. Drop those rows so the peer
+    // is treated as genuine first contact → clean TOFU re-handshake under the
+    // new namespaced key. Local roomIds encode the server via the
+    // SERVER_ID_MULTIPLIER (1e9) offset, so `id_room >= 1000000000` selects
+    // exactly the non-default servers. The orphaned bare-keyed native entries
+    // are never looked up again (harmless) and the rows re-create themselves
+    // on the next reconnect sync.
+    version: 5,
+    statements: [
+      'DELETE FROM session WHERE id_room >= 1000000000',
+    ],
+  },
 ];
 
 function applyMigrations(database: SQLiteDatabase) {

@@ -4,6 +4,7 @@ import { MessageEnvelope, generateUUID } from '@/types/message';
 import { SocketConnectionState } from '@/types/connection';
 import { useServerStore } from '@/stores/server.store';
 import { TorWebSocket } from './tor-websocket';
+import { diagnostics } from './diagnostics.service';
 
 // Re-export so existing `import { SocketConnectionState } from './socket.service'` still works
 export { SocketConnectionState } from '@/types/connection';
@@ -364,6 +365,7 @@ export class SocketService {
 
     this.socket.on('connect', () => {
       logger.info(`[Socket:${this.serverId}] Connected OK`);
+      diagnostics.event('socket', 'connect', { serverId: this.serverId, useTor: this.useTor });
       this.reconnectAttempts = 0;
       // ADR-0011: a successful connect means the primary is active again (or
       // this is the primary). Clear any liveness-lock flag — reversible.
@@ -373,11 +375,16 @@ export class SocketService {
 
     this.socket.on('disconnect', (reason) => {
       logger.info(`[Socket:${this.serverId}] Disconnected: ${reason}`);
+      diagnostics.warn('socket', 'disconnect', { serverId: this.serverId, reason: String(reason) });
       this.updateState(SocketConnectionState.CLOSED);
     });
 
     this.socket.on('connect_error', (error) => {
       logger.info(`[Socket:${this.serverId}] connect_error: ${error.message}`);
+      diagnostics.error('socket', 'connect_error', {
+        serverId: this.serverId,
+        errMsg: error?.message ?? null,
+      });
 
       if (error.message === 'BANNED') {
         logger.warn(`[Socket:${this.serverId}] Banned — updating store and disconnecting`);
@@ -414,6 +421,7 @@ export class SocketService {
 
     this.socket.io.on('reconnect_attempt', (attempt) => {
       logger.info(`[Socket:${this.serverId}] Reconnect attempt ${attempt}`);
+      diagnostics.event('socket', 'reconnect_attempt', { serverId: this.serverId, attempt });
       this.reconnectAttempts = attempt;
       this.updateState(SocketConnectionState.CONNECTING);
     });

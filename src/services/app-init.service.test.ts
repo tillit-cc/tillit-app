@@ -146,6 +146,7 @@ jest.mock('@/stores/server.store', () => ({
 
 jest.mock('@/utils/logger', () => ({
   logger: { info: jest.fn(), warn: jest.fn(), error: jest.fn() },
+  setDiagSink: jest.fn(),
 }));
 
 jest.mock('@/utils/image', () => ({

@@ -77,21 +77,40 @@ function safeStringify(arg: any): string {
   }
 }
 
+// Optional transport for the on-device diagnostics buffer (frontend-0028).
+// Set lazily by the diagnostics service so the logger has no import dependency
+// on it (avoids a cycle). Receives the already-sanitized line.
+type DiagSink = (level: 'log' | 'warn' | 'error', message: string) => void;
+let diagSink: DiagSink | null = null;
+export function setDiagSink(sink: DiagSink | null): void {
+  diagSink = sink;
+}
+
 function write(level: 'log' | 'warn' | 'error', ...args: any[]) {
   // Always log to console
   console[level](...args);
 
-  if (!STORE_LOGGING_ENABLED) return;
+  if (!STORE_LOGGING_ENABLED && !diagSink) return;
 
   // Format message for store, redacting sensitive fields
   const msg = args
     .map(a => (typeof a === 'string' ? a : safeStringify(a)))
     .join(' ');
 
-  try {
-    useAppStore.getState().addConnectionLog(msg);
-  } catch {
-    // Store not ready yet — ignore
+  if (STORE_LOGGING_ENABLED) {
+    try {
+      useAppStore.getState().addConnectionLog(msg);
+    } catch {
+      // Store not ready yet — ignore
+    }
+  }
+
+  if (diagSink) {
+    try {
+      diagSink(level, msg);
+    } catch {
+      // Diagnostics must never break logging
+    }
   }
 }
 

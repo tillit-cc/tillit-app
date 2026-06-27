@@ -12,6 +12,7 @@ import {
 } from '@/config/app.config';
 import { logger } from '@/utils/logger';
 import { toBackendRoomId } from '@/utils/server-id';
+import { signalAddressNameForRoom } from '@/utils/signal-address';
 
 /**
  * Recipient of a sender-key distribution. Accepts both legacy (number =
@@ -160,9 +161,12 @@ class SenderKeyService {
           await sessionService.ensureSession(roomId, userId);
         }
 
+        // Pair-wise encrypt of the sender-key distribution → server-namespaced
+        // address (frontend-0027): this travels over the peer's Double Ratchet
+        // session, which is keyed per-server in the native store.
         const { encryptedMessage } = await SignalProtocol.encryptMessage(
           encodeURIComponent(distributionMessage),
-          String(userId),
+          signalAddressNameForRoom(roomId, userId),
           deviceId,
         );
 
@@ -204,16 +208,23 @@ class SenderKeyService {
 
       for (const dist of distributions) {
         try {
+          // Server-namespaced sender address (frontend-0027). The pair-wise
+          // decrypt rides the per-server Double Ratchet session; the group
+          // sender-key record is stored under the same namespaced sender
+          // address so `decryptGroupMessage` (which uses the identical
+          // namespacing) can find it later.
+          const senderAddrName = signalAddressNameForRoom(roomId, dist.senderUserId);
+
           const decrypted = await SignalProtocol.decryptMessage(
             dist.encryptedSenderKey,
-            String(dist.senderUserId),
+            senderAddrName,
           );
 
           const distributionMessage = decodeURIComponent(decrypted.message);
 
           await SignalProtocol.processSenderKeyDistribution(
             String(roomId),
-            String(dist.senderUserId),
+            senderAddrName,
             distributionMessage,
             typeof dist.senderDeviceId === 'number' ? dist.senderDeviceId : null,
           );
@@ -291,10 +302,12 @@ class SenderKeyService {
     ciphertext: string,
     senderDeviceId?: number | null
   ): Promise<string> {
+    // Must match the namespaced sender address used when the distribution was
+    // stored in `fetchAndProcessPendingSenderKeys` (frontend-0027).
     const { message } = await SignalProtocol.decryptGroupMessage(
       ciphertext,
       String(roomId),
-      String(senderUserId),
+      signalAddressNameForRoom(roomId, senderUserId),
       senderDeviceId ?? null,
     );
 

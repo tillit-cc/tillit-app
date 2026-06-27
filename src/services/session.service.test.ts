@@ -240,6 +240,29 @@ describe('SessionService', () => {
   });
 
   // ==========================================================================
+  // 6b. setSession: namespaces the libsignal address per server (frontend-0027)
+  // ==========================================================================
+  it('setSession namespaces the native address for a non-default server', async () => {
+    mockSessionRepo.findByRoom.mockResolvedValue([]);
+
+    // roomId in the server-3 range (3 * 1e9 + 7) → address name must be "3:99".
+    const nonDefaultRoomId = 3 * 1_000_000_000 + 7;
+    const result = await sessionService.setSession(nonDefaultRoomId, 99, 'alice');
+
+    expect(result).toBe(true);
+    // Native store key is namespaced…
+    expect(SignalProtocol.setRemoteUserKeys).toHaveBeenCalledWith(
+      expect.objectContaining({ remoteUserId: '3:99', name: '3:99' })
+    );
+    expect(SignalProtocol.establishSession).toHaveBeenCalledWith('3:99', 1);
+    // …but the SQLite row keeps the bare server-local userId (roomId already
+    // disambiguates the server).
+    expect(mockSessionRepo.upsert).toHaveBeenCalledWith(
+      expect.objectContaining({ idUser: '99', idRoom: nonDefaultRoomId })
+    );
+  });
+
+  // ==========================================================================
   // 7. setSession: cleans up DB if establishSession fails
   // ==========================================================================
   it('setSession cleans up DB if establishSession fails', async () => {

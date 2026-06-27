@@ -9,7 +9,7 @@
     "ios": "expo run:ios",
     "web": "expo start --web",
     "lint": "expo lint",
-    "sim:ios": "expo run:ios --device ADF27FE3-58A7-4F51-99BF-FEBCE2CB7390",
+    "sim:ios": "expo run:ios --device 9F1675FD-3A1E-4479-8C7A-BCD2C7F88D1B",
     "sim:android": "expo run:android --device Pixel_9_Pro_API_35",
     "postinstall": "patch-package && ./scripts/download-arti.sh",
     "publish:ios": "npx eas-cli@latest build --platform ios --profile production --auto-submit",

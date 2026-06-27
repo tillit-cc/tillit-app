@@ -8,6 +8,8 @@ import { useAppStore } from '@/stores/app.store';
 import { logger } from '@/utils/logger';
 import { Session } from '@/db/schema';
 import { getServerIdFromRoomId } from '@/utils/server-id';
+import { signalAddressNameForRoom } from '@/utils/signal-address';
+import { diagnostics } from './diagnostics.service';
 import { PRIMARY_DEVICE_ID } from '@/config/app.config';
 
 const PREKEY_THRESHOLD = 10;
@@ -316,9 +318,13 @@ class SessionService {
 
     let sessionEstablished = false;
 
+    // Namespace the libsignal address by server (frontend-0027): userIds are
+    // not unique across servers, so the native store must be keyed per-server.
+    const addrName = signalAddressNameForRoom(roomId, remoteUserIdStr);
+
     try {
       await SignalProtocol.setRemoteUserKeys({
-        remoteUserId: remoteUserIdStr,
+        remoteUserId: addrName,
         preKeyId: formattedKeys.preKeyId,
         preKeyPublicKey: formattedKeys.preKeyPublicKey,
         signedPreKeyId: formattedKeys.signedPreKeyId,
@@ -327,17 +333,33 @@ class SessionService {
         identityPublicKey: formattedKeys.identityPublicKey,
         registrationId: formattedKeys.registrationId,
         deviceId: formattedKeys.deviceId,
-        name: formattedKeys.name,
+        name: addrName,
         kyberPreKeyId: formattedKeys.kyberPreKeyId,
         kyberPreKeyPublicKey: formattedKeys.kyberPreKeyPublicKey,
         kyberPreKeySignature: formattedKeys.kyberPreKeySignature,
       });
 
-      await SignalProtocol.establishSession(remoteUserIdStr, formattedKeys.deviceId);
+      await SignalProtocol.establishSession(addrName, formattedKeys.deviceId);
       sessionEstablished = true;
       logger.info('[SessionService] Session established successfully');
+      diagnostics.event('session', 'establish.ok', {
+        serverId: getServerIdFromRoomId(roomId),
+        roomId,
+        userId: remoteUserId,
+        deviceId: formattedKeys.deviceId,
+        path: 'fresh',
+      });
     } catch (error: any) {
       logger.error('[SessionService] Failed to establish session:', error?.message || error);
+      diagnostics.error('session', 'establish.fail', {
+        serverId: getServerIdFromRoomId(roomId),
+        roomId,
+        userId: remoteUserId,
+        deviceId: formattedKeys.deviceId,
+        path: 'fresh',
+        errName: error?.name ?? null,
+        errMsg: error?.message ?? null,
+      });
 
       try {
         await sessionRepository.deleteByUserAndRoom(remoteUserIdStr, roomId);
@@ -385,7 +407,7 @@ class SessionService {
     logger.info('[SessionService] Resuming session with', userId);
 
     try {
-      await SignalProtocol.resumeSession(String(userId), username, deviceId);
+      await SignalProtocol.resumeSession(signalAddressNameForRoom(roomId, userId), username, deviceId);
       logger.info('[SessionService] Session resumed successfully');
     } catch (error) {
       logger.info('[SessionService] Resume failed, attempting recovery:', error);
@@ -481,9 +503,11 @@ class SessionService {
       return false;
     }
 
+    const ownAddrName = signalAddressNameForRoom(roomId, ownUserIdStr);
+
     try {
       await SignalProtocol.setRemoteUserKeys({
-        remoteUserId: ownUserIdStr,
+        remoteUserId: ownAddrName,
         preKeyId: Number(preKey.keyId),
         preKeyPublicKey: String(preKey.keyData),
         signedPreKeyId: Number(signedPreKey.keyId),
@@ -492,12 +516,12 @@ class SessionService {
         identityPublicKey: String(target.identityPublicKey),
         registrationId: Number(target.registrationId),
         deviceId,
-        name: `self-${deviceId}`,
+        name: ownAddrName,
         kyberPreKeyId: Number(kyberPreKey.keyId),
         kyberPreKeyPublicKey: String(kyberPreKey.keyData),
         kyberPreKeySignature: String(kyberPreKey.signature),
       });
-      await SignalProtocol.establishSession(ownUserIdStr, deviceId);
+      await SignalProtocol.establishSession(ownAddrName, deviceId);
 
       const now = Math.floor(Date.now() / 1000);
       await sessionRepository.upsert({
@@ -598,9 +622,11 @@ class SessionService {
       return false;
     }
 
+    const peerAddrName = signalAddressNameForRoom(roomId, remoteUserIdStr);
+
     try {
       await SignalProtocol.setRemoteUserKeys({
-        remoteUserId: remoteUserIdStr,
+        remoteUserId: peerAddrName,
         preKeyId: Number(preKey.keyId),
         preKeyPublicKey: String(preKey.keyData),
         signedPreKeyId: Number(signedPreKey.keyId),
@@ -609,12 +635,12 @@ class SessionService {
         identityPublicKey: String(target.identityPublicKey),
         registrationId: Number(target.registrationId),
         deviceId,
-        name: remoteUserIdStr,
+        name: peerAddrName,
         kyberPreKeyId: Number(kyberPreKey.keyId),
         kyberPreKeyPublicKey: String(kyberPreKey.keyData),
         kyberPreKeySignature: String(kyberPreKey.signature),
       });
-      await SignalProtocol.establishSession(remoteUserIdStr, deviceId);
+      await SignalProtocol.establishSession(peerAddrName, deviceId);
 
       const now = Math.floor(Date.now() / 1000);
       await sessionRepository.upsert({
@@ -708,7 +734,11 @@ class SessionService {
       if (resumedKeys.has(sessionKey)) continue;
 
       try {
-        await SignalProtocol.resumeSession(userId, session.remoteUserName, session.remoteUserDeviceId);
+        await SignalProtocol.resumeSession(
+          signalAddressNameForRoom(session.idRoom, userId),
+          session.remoteUserName,
+          session.remoteUserDeviceId,
+        );
         resumedKeys.add(sessionKey);
       } catch (error) {
         logger.info('[SessionService] Error resuming session for', sessionKey, error);
@@ -748,17 +778,34 @@ class SessionService {
     // substitute the remote user's identity while we're rebuilding the session.
     await this.assertIdentityNotChanged(roomId, remoteUserId, String(remoteKeys.identityPublicKey || ''));
 
+    const addrName = signalAddressNameForRoom(roomId, remoteUserId);
+
     try {
-      await this.applyRemoteKeys(remoteUserId, remoteKeys);
+      await this.applyRemoteKeys(addrName, remoteKeys);
       // Match the (userId, deviceId) slot that `applyRemoteKeys` just wrote
       // via setRemoteUserKeys — without this, the existence check inside
       // `establishSession` always looks at slot 1 and rejects when the
       // remote user is on a linked device (deviceId != 1).
       const recoveredDeviceId = Number(remoteKeys?.deviceId ?? 1) || 1;
-      await SignalProtocol.establishSession(String(remoteUserId), recoveredDeviceId);
+      await SignalProtocol.establishSession(addrName, recoveredDeviceId);
       logger.info('[SessionService] Session recovered for', remoteUserId);
-    } catch (error) {
+      diagnostics.event('session', 'establish.ok', {
+        serverId: getServerIdFromRoomId(roomId),
+        roomId,
+        userId: remoteUserId,
+        deviceId: recoveredDeviceId,
+        path: 'recover',
+      });
+    } catch (error: any) {
       logger.error('[SessionService] Recovery failed:', error);
+      diagnostics.error('session', 'establish.fail', {
+        serverId: getServerIdFromRoomId(roomId),
+        roomId,
+        userId: remoteUserId,
+        path: 'recover',
+        errName: error?.name ?? null,
+        errMsg: error?.message ?? null,
+      });
       throw new Error(`Failed to recover session for user ${remoteUserId}: ${error}`);
     }
   }
@@ -777,12 +824,21 @@ class SessionService {
     let result: { changed: boolean; reason?: string } | undefined;
     let nativeError: unknown;
     try {
-      result = await SignalProtocol.checkIdentityKeyChanged(remoteUserId, newIdentityKey);
+      result = await SignalProtocol.checkIdentityKeyChanged(
+        signalAddressNameForRoom(roomId, remoteUserId),
+        newIdentityKey,
+      );
     } catch (error) {
       nativeError = error;
     }
 
     if (result?.changed) {
+      diagnostics.error('session', 'identityMismatch', {
+        serverId: getServerIdFromRoomId(roomId),
+        roomId,
+        userId: remoteUserId,
+        reason: 'native-changed',
+      });
       this.handleIdentityKeyChanged(roomId, Number(remoteUserId));
       throw new IdentityKeyMismatchError(remoteUserId);
     }
@@ -798,6 +854,12 @@ class SessionService {
         'but native store has no trusted identity — refusing to TOFU on recovery',
         nativeError ? `(native error: ${(nativeError as any)?.message ?? nativeError})` : '(reason: No identity saved yet)'
       );
+      diagnostics.error('session', 'identityMismatch', {
+        serverId: getServerIdFromRoomId(roomId),
+        roomId,
+        userId: remoteUserId,
+        reason: 'priorSession-noNativeIdentity',
+      });
       this.handleIdentityKeyChanged(roomId, Number(remoteUserId));
       throw new IdentityKeyMismatchError(remoteUserId);
     }
@@ -821,13 +883,14 @@ class SessionService {
   }
 
   async checkIdentityChanged(roomId: number, remoteUserId: string): Promise<boolean> {
-    const { changed, reason } = await SignalProtocol.checkIdentityKeyChanged(remoteUserId);
+    const addrName = signalAddressNameForRoom(roomId, remoteUserId);
+    const { changed, reason } = await SignalProtocol.checkIdentityKeyChanged(addrName);
 
     if (reason && reason.includes('No identity saved')) {
       try {
         const keys = await this.fetchRemoteKeys(roomId, remoteUserId);
-        await this.applyRemoteKeys(remoteUserId, keys);
-        const result = await SignalProtocol.checkIdentityKeyChanged(remoteUserId);
+        await this.applyRemoteKeys(addrName, keys);
+        const result = await SignalProtocol.checkIdentityKeyChanged(addrName);
         return result.changed;
       } catch (error) {
         logger.error('[SessionService] Failed to reload keys:', error);
@@ -1082,14 +1145,18 @@ class SessionService {
    * Commit fetched remote keys to the native protocol store. Caller is
    * responsible for any validation (e.g. identity key trust check) prior
    * to invoking this — once called, the local identity store is updated.
+   *
+   * `addrName` is the server-namespaced libsignal address name
+   * ({@link signalAddressNameForRoom}), NOT the bare userId — the native
+   * session/identity store is keyed per-server (frontend-0027).
    */
-  private async applyRemoteKeys(remoteUserId: string, remoteKeys: any): Promise<void> {
+  private async applyRemoteKeys(addrName: string, remoteKeys: any): Promise<void> {
     const preKey = remoteKeys.preKey || null;
     const kyberPreKey = remoteKeys.kyberPreKey || null;
     const signedPreKey = remoteKeys.signedPreKey || null;
 
     await SignalProtocol.setRemoteUserKeys({
-      remoteUserId: String(remoteUserId),
+      remoteUserId: String(addrName),
       preKeyId: Number(preKey?.keyId),
       preKeyPublicKey: String(preKey?.keyData || ''),
       signedPreKeyId: Number(signedPreKey?.keyId),
@@ -1098,7 +1165,7 @@ class SessionService {
       identityPublicKey: String(remoteKeys.identityPublicKey || ''),
       registrationId: Number(remoteKeys.registrationId),
       deviceId: Number(remoteKeys.deviceId || 1),
-      name: String(remoteUserId),
+      name: String(addrName),
       kyberPreKeyId: Number(kyberPreKey?.keyId),
       kyberPreKeyPublicKey: String(kyberPreKey?.keyData || ''),
       kyberPreKeySignature: String(kyberPreKey?.signature || ''),

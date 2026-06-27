@@ -239,6 +239,22 @@ export default {
     deleteAccountPartialMsg: 'I dati locali sono stati eliminati, ma {{count}} server non ha confermato la cancellazione. Eventuali dati residui su quei server diventeranno comunque irrecuperabili senza la tua chiave privata.',
     deleteAccountError: "Errore durante l'eliminazione. Riprova.",
   },
+  diagnostics: {
+    section: 'Diagnostica',
+    sectionDescription: 'Registra log tecnici redatti su questo dispositivo per analizzare eventuali problemi. Non include messaggi, chiavi o token. Nessun dato viene inviato a server: lo condividi tu manualmente.',
+    toggle: 'Log diagnostici',
+    title: 'Log diagnostici',
+    export: 'Esporta dati diagnostici',
+    exporting: 'Esportazione...',
+    exportError: "Errore durante l'esportazione dei log.",
+    emptyMsg: 'Nessun log diagnostico da esportare.',
+    shareTitle: 'Condividi log diagnostici',
+    shareUnavailable: 'Condivisione non disponibile su questo dispositivo.',
+    wipe: 'Cancella log',
+    wipeTitle: 'Cancella log diagnostici',
+    wipeMsg: 'Vuoi eliminare tutti i log diagnostici da questo dispositivo?',
+  },
+
   linkedDevices: {
     // Section in profile
     section: 'Dispositivi collegati',

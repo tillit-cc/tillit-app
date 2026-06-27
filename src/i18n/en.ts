@@ -239,6 +239,22 @@ export default {
     deleteAccountPartialMsg: 'Local data has been deleted, but {{count}} server did not confirm the deletion. Any residual data on those servers becomes unrecoverable without your private key.',
     deleteAccountError: 'Deletion failed. Please try again.',
   },
+  diagnostics: {
+    section: 'Diagnostics',
+    sectionDescription: 'Capture redacted technical logs on this device to investigate issues. Never includes messages, keys or tokens. Nothing is sent to any server — you share it manually.',
+    toggle: 'Diagnostic logs',
+    title: 'Diagnostic logs',
+    export: 'Export diagnostic data',
+    exporting: 'Exporting...',
+    exportError: 'Failed to export logs.',
+    emptyMsg: 'No diagnostic logs to export.',
+    shareTitle: 'Share diagnostic logs',
+    shareUnavailable: 'Sharing is not available on this device.',
+    wipe: 'Clear logs',
+    wipeTitle: 'Clear diagnostic logs',
+    wipeMsg: 'Delete all diagnostic logs from this device?',
+  },
+
   linkedDevices: {
     section: 'Linked devices',
     sectionDescription: 'Add another device (e.g. desktop) to access the same account.',
